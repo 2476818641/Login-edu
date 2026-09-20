@@ -84,6 +84,18 @@ normalize_url() {
 		*)     printf 'http://%s' "$1" ;;
 	esac
 }
+# 本机在该 WAN 口上的 IPv4（有些门户把客户端 IP 掺进哈希：md5(密码+IP)）。取不到就返回空
+wan_ip() {
+	for _i in "${WANIF:-}" wan wwan eth1; do
+		[ -n "$_i" ] || continue
+		_p="$(ip -4 -o addr show dev "$_i" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+		[ -n "$_p" ] && { printf '%s' "$_p"; return 0; }
+	done
+	_p="$(ubus call network.interface.wan status 2>/dev/null | sed -n 's/.*"address": *"\([0-9.]*\)".*/\1/p' | head -1)"
+	printf '%s' "$_p"
+}
+# 门户主机名（不含协议与路径），例如 10.30.100.5:801
+portal_host() { normalize_url "${PORTAL:-}" | sed 's|^[a-z][a-z]*://||; s|/.*$||'; }
 md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 
 # ---------------------------------------------------------------- 子命令
@@ -194,15 +206,26 @@ case "${1:-}" in
 		exit 2
 	fi
 	echo "账号: ${CAMPUS_USER:-（未配）}"
-	echo "把下面每一行右边那串，和抓包 POST body 里 pass= 后面的值对比，一样的就是正确方式："
-	printf '  md5(明文)             %s\n'   "$(md5hex "$CAMPUS_PASS")"
-	printf '  md5(账号+明文)        %s\n'   "$(md5hex "$CAMPUS_USER$CAMPUS_PASS")"
-	printf '  md5(明文+账号)        %s\n'   "$(md5hex "$CAMPUS_PASS$CAMPUS_USER")"
-	printf '  md5(md5(明文))        %s\n'   "$(md5hex "$(md5hex "$CAMPUS_PASS")")"
-	printf '  md5(明文) 大写        %s\n'   "$(md5hex "$CAMPUS_PASS" | tr 'a-f' 'A-F')"
+	env_or_uci WANIF campus.main.iface 'wan'
+	env_or_uci PORTAL campus.main.auth_url ''
+	IP="$(wan_ip)"; PH="$(portal_host)"
+	echo "本机 WAN IPv4: ${IP:-（取不到）}   门户主机: ${PH:-（未配）}"
 	echo
-	echo "对应设置：uci set campus.main.pass_mode=md5 | md5user | md5passuser | md5md5"
-	echo "都不匹配：说明还有盐/前缀，把认证页里算密码的那段 JS 发我"
+	echo "把下面每行右边的 32 位，和抓包 POST body 里 pass= 后面的值逐一对比："
+	printf '  %-14s %s\n' "md5"            "$(md5hex "$CAMPUS_PASS")"
+	printf '  %-14s %s\n' "md5user"        "$(md5hex "$CAMPUS_USER$CAMPUS_PASS")"
+	printf '  %-14s %s\n' "md5passuser"    "$(md5hex "$CAMPUS_PASS$CAMPUS_USER")"
+	printf '  %-14s %s\n' "md5md5"         "$(md5hex "$(md5hex "$CAMPUS_PASS")")"
+	[ -n "$IP" ] && printf '  %-14s %s\n' "md5passip"     "$(md5hex "$CAMPUS_PASS$IP")"
+	[ -n "$IP" ] && printf '  %-14s %s\n' "md5ippass"     "$(md5hex "$IP$CAMPUS_PASS")"
+	[ -n "$PH" ] && printf '  %-14s %s\n' "md5passhost"   "$(md5hex "$CAMPUS_PASS$PH")"
+	printf '  %-14s %s\n' "MD5UPPER"       "$(md5hex "$CAMPUS_PASS" | tr 'a-f' 'A-F')"
+	echo
+	echo "对上哪个就：uci set campus.main.pass_mode=<左边那个名字>; uci commit campus"
+	echo "一个都对不上：说明盐不是上面这些（可能是页面下发的随机数），"
+	echo "  → 用浏览器打开 http://门户地址/ 按 Ctrl+F5 强制刷新（绕过缓存，js 才会重新下载），"
+	echo "    同时用 Burp 抓这次页面加载，把新抓到的 js 发我；或直接 Ctrl+U 看源码搜 md5/encrypt"
+	echo "⚠️ 别拿不同账号的抓包比对；也别连续盲试密码（有些门户会锁账号）"
 	exit 0
 	;;
 --install-hook)
@@ -261,13 +284,18 @@ FORCE="${FORCE:-0}"; QUIET="${QUIET:-0}"
 # PORTAL：门户基地址（不带路径），例如 http://10.30.100.5
 env_or_uci PORTAL       campus.main.auth_url     ''					# ← 抓包①：门户地址
 # 按顺序提交的接口路径，逗号分隔。单接口门户就写一个（如 /srun_portal）
-env_or_uci API_PATHS    campus.main.api_paths    '/api/login.php,/api/ack_auth.php,/api/stat.php'	# ← 抓包②：流程
+# 顺序来源：①浏览器抓包是 login → ack_auth → stat；②实测可用的手写脚本是 login → stat → ack_auth。
+# 两者都能通过认证 ⇒ 后两步顺序不敏感。这里默认用②（实测过的那份）。
+env_or_uci API_PATHS    campus.main.api_paths    '/api/login.php,/api/stat.php,/api/ack_auth.php'	# ← 抓包②：流程
 env_or_uci EXTRA_FIELDS campus.main.extra_fields 'authmode=0&pool=&isp_id=0&pxyacct='			# ← 抓包③：固定字段
 env_or_uci USER_FIELD   campus.main.user_field   'user'
 env_or_uci PASS_FIELD   campus.main.pass_field   'pass'
 env_or_uci PASS_MODE    campus.main.pass_mode    'md5'
 env_or_uci PASS_MD5     campus.main.pass_md5     ''	# 设置后直接用这串，跳过哈希（应急用）
 env_or_uci PRE_GET      campus.main.pre_get      '1'	# 1=先 GET 首页拿会话 cookie
+# 登录前要 POST 的接口（空 body，只为拿会话/让服务端记住本机 IP）。实测门户是 /api/ip.php；
+# 不需要就设成空：uci set campus.main.pre_paths=''
+env_or_uci PRE_PATHS    campus.main.pre_paths    '/api/ip.php'	# ← 抓包⑤：登录前的前置请求
 env_or_uci CHECK_URL    campus.main.check_url    'http://connect.rom.miui.com/generate_204'
 env_or_uci PING_TARGET  campus.main.ping_check   '223.5.5.5'	# 设为 - 则不用 ping 兜底
 env_or_uci CAMPUS_USER  campus.main.user         ''
@@ -285,6 +313,9 @@ pass_value() {	# 输出要提交的 pass 值（抓包里 pass= 后面那个）
 		md5user)       md5hex "$CAMPUS_USER$CAMPUS_PASS" ;;
 		md5passuser)   md5hex "$CAMPUS_PASS$CAMPUS_USER" ;;
 		md5md5)        md5hex "$(md5hex "$CAMPUS_PASS")" ;;
+		md5passip)     md5hex "$CAMPUS_PASS$(wan_ip)" ;;
+		md5ippass)     md5hex "$(wan_ip)$CAMPUS_PASS" ;;
+		md5passhost)   md5hex "$CAMPUS_PASS$(portal_host)" ;;
 		*)             printf '%s' "$CAMPUS_PASS" ;;
 	esac
 }
@@ -328,17 +359,23 @@ json_strip_jsonp() {
 json_num() { printf '%s' "$1" | tr -d '\n' | sed -n "s/.*\"$2\":\(-\{0,1\}[0-9][0-9]*\).*/\1/p" | head -1; }
 json_str() { printf '%s' "$1" | tr -d '\n' | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" | head -1; }
 
-# ---------------------------------------------------------------- 1) 先 GET 门户首页拿会话 cookie
-#    抓包里三条 POST 都带 Cookie: RAASSESSID=…，这个 cookie 来自首页那次 GET。
-#    如果实测发现不带 cookie 也能登录，把它关掉即可：uci set campus.main.pre_get=0
+# ---------------------------------------------------------------- 1) 前置请求：拿会话 cookie / 让服务端记住本机 IP
+#    ① GET 门户首页：抓包里三条 POST 都带 Cookie: RAASSESSID=…，这个 cookie 就来自首页那次 GET
+#    ② POST 前置接口（实测门户是 /api/ip.php，空 body）：名字就叫 ip，怀疑服务端据此记录客户端 IP
 if [ "$PRE_GET" = 1 ]; then
 	rm -f "$COOKIE"
 	if curl_auth -c "$COOKIE" -b "$COOKIE" -o /dev/null "$PORTAL/" 2>/dev/null; then
 		say "已 GET $PORTAL/（拿会话 cookie）"
 	else
-		say "首页 GET 失败，继续尝试直接登录"
+		say "首页 GET 失败，继续"
 	fi
 fi
+for _pre in $(printf '%s' "$PRE_PATHS" | tr ',' ' '); do
+	[ -n "$_pre" ] || continue
+	case "$_pre" in /*) _purl="$PORTAL$_pre" ;; *) _purl="$PORTAL/$_pre" ;; esac
+	PRERESP="$(curl_auth -b "$COOKIE" -c "$COOKIE" 		-H 'X-Requested-With: XMLHttpRequest' 		-H "Referer: $PORTAL/" -H "Origin: $PORTAL" 		-X POST --data '' "$_purl" 2>/dev/null)"
+	say "前置 $_pre → $(printf '%s' "$PRERESP" | head -c 200)"
+done
 
 # ---------------------------------------------------------------- 2) 按顺序提交（本项目是三步）
 PASSV="$(pass_value)"

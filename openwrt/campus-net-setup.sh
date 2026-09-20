@@ -98,10 +98,13 @@ msg "    默认路由出口 : ${DEFDEV_RAW:-还没通}$([ -n "$DEFDEV_RAW" ] && 
 msg "    当前 WAN MAC : $(cat "$SYSFS/$WANDEV/address" 2>/dev/null || echo 未知)"
 msg "    当前 WAN MTU : $(cat "$SYSFS/$WANDEV/mtu" 2>/dev/null || echo 未知)"
 msg "    TTL 规则     : $([ -f "$TTL_FILE" ] && echo "有（$TTL_FILE，会被覆盖）" || echo 无)"
-if [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; then
-	msg "    UA2F         : 已安装（启用=$([ "$(uget ua2f.enabled.enabled)" = 1 ] && echo 是 || echo 否)）"
+# 状态栏优先报 UA3F（当前推荐方案），没有再报老 UA2F
+if [ -x /usr/bin/ua3f ] || [ -n "$(uget ua3f.enabled.enabled)" ]; then
+	msg "    UA3F         : 已安装（启用=$([ "$(uget ua3f.enabled.enabled)" = 1 ] && echo 是 || echo 否)，服务模式=$(uget ua3f.main.server_mode)，UA=$(uget ua3f.main.ua)）"
+elif [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; then
+	msg "    UA2F         : 已安装（老方案，只改 UA；启用=$([ "$(uget ua2f.enabled.enabled)" = 1 ] && echo 是 || echo 否)）"
 else
-	msg "    UA2F         : 未安装"
+	msg "    UA3F / UA2F  : 都没装"
 fi
 
 # LAN 网桥设备名（判断无线上联是"路由模式"还是"桥接中继"）
@@ -115,6 +118,7 @@ if [ -n "$DEFDEV_RAW" ] && [ -e "$SYSFS/$LANBR/brif/$DEFDEV_RAW" ]; then
 elif [ -n "$DEFDEV_RAW" ]; then
 	case "$DEFDEV_RAW" in
 	*sta*|wlan*|ra[0-9]*|apcl*)
+		WIRELESS_UPLINK=1	# 自动识别：出口是无线 → MTU 默认 keep、MAC 提示走无线分支
 		msg "    无线上联   : $DEFDEV_RAW（路由模式 ✅ —— 独立的 network.$WANIF + 本身是另一个网段）" ;;
 	esac
 fi
@@ -184,7 +188,7 @@ esac
 if [ -n "$CLONE_MAC" ]; then
 	printf '%s' "$CLONE_MAC" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' \
 		|| die "MAC 格式不对：$CLONE_MAC（要 AA:BB:CC:DD:EE:FF）"
-	if [ -n "${WIFI_UPLINK:-}" ]; then
+	if [ -n "${WIFI_UPLINK:-}${WIRELESS_UPLINK:-}" ]; then
 		msg "    注意：无线上网的 MAC 通常要写在 wireless 的 wifi-iface 上（驱动可能有限制）"
 		msg "          本脚本写的是 network 的 device 段；若无效就手动加："
 		msg "          uci set wireless.<STA段>.macaddr='$CLONE_MAC'"
@@ -206,7 +210,7 @@ fi
 # --- 2.2 MTU
 DEF_MTU=1500
 [ "$CAMPUS_MODE" = "pppoe" ] && DEF_MTU=1492
-[ -n "${WIFI_UPLINK:-}" ] && DEF_MTU=keep	# 无线侧 MTU 由 AP 决定，别乱改
+[ -n "${WIFI_UPLINK:-}${WIRELESS_UPLINK:-}" ] && DEF_MTU=keep	# 无线侧 MTU 由 AP 决定，别乱改
 ask "    MTU（回车=$DEF_MTU，不想改就填 keep）" "$DEF_MTU"
 MTU="$REPLY"
 if [ "$MTU" != "keep" ] && [ -n "$MTU" ]; then
@@ -458,7 +462,7 @@ else
       4) 手动验证一次：/etc/campus-portal-auth.sh
       5) 装成开机自动登录：/etc/campus-portal-auth.sh --install-hook
 EOF
-		if [ -n "${WIFI_UPLINK:-}" ]; then
+		if [ -n "${WIFI_UPLINK:-}${WIRELESS_UPLINK:-}" ]; then
 			msg "    无线上联注意：认证接口有时要带 mac 参数，用你克隆上去的那个 MAC；"
 			msg "                  另外 STA 掉线重连后如果又不通，多半是要重新认证（--install-hook 的 cron 会补）"
 		fi

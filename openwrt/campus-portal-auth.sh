@@ -96,6 +96,18 @@ wan_ip() {
 }
 # 门户主机名（不含协议与路径），例如 10.30.100.5:801
 portal_host() { normalize_url "${PORTAL:-}" | sed 's|^[a-z][a-z]*://||; s|/.*$||'; }
+# 本机 WAN 口的 MAC（校园网"IP 绑 MAC"时，门户的哈希里常常掺它）
+wan_mac() {
+	for _i in "${WANIF:-}" wan wwan eth1; do
+		[ -n "$_i" ] || continue
+		_m=""
+		[ -r "/sys/class/net/$_i/address" ] && _m="$(cat "/sys/class/net/$_i/address" 2>/dev/null)"
+		[ -z "$_m" ] && _m="$(ip link show "$_i" 2>/dev/null | awk '/link\/ether/{print $2; exit}')"
+		[ -n "$_m" ] && { printf '%s' "$_m"; return 0; }
+	done
+	printf ''
+}
+mac_nosep() { printf '%s' "$1" | tr -d ':-' | tr 'A-F' 'a-f'; }
 md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 
 # ---------------------------------------------------------------- 子命令
@@ -206,21 +218,48 @@ case "${1:-}" in
 		exit 2
 	fi
 	echo "账号: ${CAMPUS_USER:-（未配）}"
+	EXPECT="${2:-}"		# 可选：直接给出抓包里的哈希，命中会标出来
+	[ -n "$EXPECT" ] && echo "要比对的已知哈希: $EXPECT"
 	env_or_uci WANIF campus.main.iface 'wan'
 	env_or_uci PORTAL campus.main.auth_url ''
-	IP="$(wan_ip)"; PH="$(portal_host)"
-	echo "本机 WAN IPv4: ${IP:-（取不到）}   门户主机: ${PH:-（未配）}"
+	IP="$(wan_ip)"; PH="$(portal_host)"; MAC="$(wan_mac)"
+	echo "本机 WAN IPv4: ${IP:-（取不到）}   WAN MAC: ${MAC:-（取不到）}   门户主机: ${PH:-（未配）}"
 	echo
-	echo "把下面每行右边的 32 位，和抓包 POST body 里 pass= 后面的值逐一对比："
-	printf '  %-14s %s\n' "md5"            "$(md5hex "$CAMPUS_PASS")"
-	printf '  %-14s %s\n' "md5user"        "$(md5hex "$CAMPUS_USER$CAMPUS_PASS")"
-	printf '  %-14s %s\n' "md5passuser"    "$(md5hex "$CAMPUS_PASS$CAMPUS_USER")"
-	printf '  %-14s %s\n' "md5md5"         "$(md5hex "$(md5hex "$CAMPUS_PASS")")"
-	[ -n "$IP" ] && printf '  %-14s %s\n' "md5passip"     "$(md5hex "$CAMPUS_PASS$IP")"
-	[ -n "$IP" ] && printf '  %-14s %s\n' "md5ippass"     "$(md5hex "$IP$CAMPUS_PASS")"
-	[ -n "$PH" ] && printf '  %-14s %s\n' "md5passhost"   "$(md5hex "$CAMPUS_PASS$PH")"
-	printf '  %-14s %s\n' "MD5UPPER"       "$(md5hex "$CAMPUS_PASS" | tr 'a-f' 'A-F')"
+	HIT=0
+	try_hash() {	# try_hash <pass_mode 名字> <哈希>
+		[ -n "${2:-}" ] || return 0
+		if [ -n "$EXPECT" ] && [ "$2" = "$EXPECT" ]; then
+			printf '  %-14s %s   ← ✅ 命中\n' "$1" "$2"
+			HIT=1
+		else
+			printf '  %-14s %s\n' "$1" "$2"
+		fi
+	}
+	echo "逐行和抓包 POST body 里 pass= 后面的值对比（也可以在命令后面直接跟目标哈希）："
+	try_hash md5          "$(md5hex "$CAMPUS_PASS")"
+	try_hash md5user      "$(md5hex "$CAMPUS_USER$CAMPUS_PASS")"
+	try_hash md5passuser  "$(md5hex "$CAMPUS_PASS$CAMPUS_USER")"
+	try_hash md5md5       "$(md5hex "$(md5hex "$CAMPUS_PASS")")"
+	try_hash md5passip    "$(md5hex "$CAMPUS_PASS$IP")"
+	try_hash md5ippass    "$(md5hex "$IP$CAMPUS_PASS")"
+	try_hash md5passhost  "$(md5hex "$CAMPUS_PASS$PH")"
+	try_hash md5passmac   "$(md5hex "$CAMPUS_PASS$MAC")"
+	try_hash md5macpass   "$(md5hex "$MAC$CAMPUS_PASS")"
+	try_hash md5passmacns "$(md5hex "$CAMPUS_PASS$(mac_nosep "$MAC")")"
+	try_hash md5passipmac "$(md5hex "$CAMPUS_PASS$IP$MAC")"
+	try_hash md5passmacip "$(md5hex "$CAMPUS_PASS$MAC$IP")"
+	try_hash MD5UPPER     "$(md5hex "$CAMPUS_PASS" | tr 'a-f' 'A-F')"
 	echo
+	if [ "$HIT" = 1 ]; then
+		echo "✅ 命中上面标出来的那个 —— 执行："
+		echo "   uci set campus.main.pass_mode=<命中的名字> && uci commit campus && $SELF --force"
+		exit 0
+	fi
+	if [ -n "$EXPECT" ]; then
+		echo "❌ 与这个哈希都不匹配 —— 说明盐不是 IP/MAC/账号/门户这些常量。"
+		echo "   下一步：把门户下发的随机盐找出来（认证页的 JS）"
+		exit 1
+	fi
 	echo "对上哪个就：uci set campus.main.pass_mode=<左边那个名字>; uci commit campus"
 	echo "一个都对不上：说明盐不是上面这些（可能是页面下发的随机数），"
 	echo "  → 用浏览器打开 http://门户地址/ 按 Ctrl+F5 强制刷新（绕过缓存，js 才会重新下载），"
@@ -316,6 +355,11 @@ pass_value() {	# 输出要提交的 pass 值（抓包里 pass= 后面那个）
 		md5passip)     md5hex "$CAMPUS_PASS$(wan_ip)" ;;
 		md5ippass)     md5hex "$(wan_ip)$CAMPUS_PASS" ;;
 		md5passhost)   md5hex "$CAMPUS_PASS$(portal_host)" ;;
+		md5passmac)    md5hex "$CAMPUS_PASS$(wan_mac)" ;;
+		md5macpass)    md5hex "$(wan_mac)$CAMPUS_PASS" ;;
+		md5passmacns)  md5hex "$CAMPUS_PASS$(mac_nosep "$(wan_mac)")" ;;
+		md5passipmac)  md5hex "$CAMPUS_PASS$(wan_ip)$(wan_mac)" ;;
+		md5passmacip)  md5hex "$CAMPUS_PASS$(wan_mac)$(wan_ip)" ;;
 		*)             printf '%s' "$CAMPUS_PASS" ;;
 	esac
 }

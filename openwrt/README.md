@@ -166,6 +166,10 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 > 5. 哈希仍未破解：已知明文 `213511` ↔ 哈希 `fc824d7f244805c56634c66e16ded895`，
 >    用 `tools/md5-probe.py` 试了 **6.7 万种**常见拼法（账号/门户/常见盐/分隔符/顺序/双重 md5/大小写）全部未命中
 >    ⇒ 盐不是常量文本，最可能是**客户端 IP**（所以才有 `/api/ip.php`）。
+>    （校园网"IP 绑 MAC"的话，盐也可能是 MAC —— 脚本与探针都已经把 MAC 及相关组合纳入候选，
+>      含 `md5(明文+MAC)`、`md5(明文+MAC无分隔符)`、`md5(明文+IP+MAC)` 等。
+>      路由器上直接一条命令就能判定：`/etc/campus-portal-auth.sh --hash-test <抓包里的哈希>`，
+>      它会拿本机真实 WAN IP/MAC 算完并标出命中的 `pass_mode`。）
 >    拿到 `POST /api/ip.php` 返回的 IP 后再跑一次探针即可确认：
 >    `python3 tools/md5-probe.py --plain 213511 --hash fc824d… --user 05261241 --host 10.30.100.5 --salt <IP>`
 >    ⚠️ 若哈希确实绑定客户端 IP，那**硬编码哈希只在 IP 不变时有效**，换 IP/重拨就会失效。

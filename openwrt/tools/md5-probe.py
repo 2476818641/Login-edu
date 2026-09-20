@@ -44,6 +44,19 @@ def variants(p: str) -> list:
     return out
 
 
+def mac_variants(mac: str) -> list:
+    """MAC 的各写法：aa:bb:cc:dd:ee:ff / AA:BB:.. / aa-bb-.. / aabbccddeeff / AABBCCDDEEFF"""
+    hexs = "".join(c for c in mac if c in "0123456789abcdefABCDEF")
+    if len(hexs) != 12:
+        return [mac]          # 不是标准 MAC 就原样当盐
+    lo, up = hexs.lower(), hexs.upper()
+    pairs_lo = ":".join(lo[i:i + 2] for i in range(0, 12, 2))
+    pairs_up = ":".join(up[i:i + 2] for i in range(0, 12, 2))
+    dash_lo = pairs_lo.replace(":", "-")
+    dash_up = pairs_up.replace(":", "-")
+    return [lo, up, pairs_lo, pairs_up, dash_lo, dash_up]
+
+
 def build_candidates(plain, user, host, salts):
     """返回 {公式描述: 哈希}"""
     cands = {}
@@ -80,6 +93,9 @@ def main():
     ap.add_argument("--user", default="", help="认证账号")
     ap.add_argument("--host", default="", help="门户主机（如 10.30.100.5 或带端口）")
     ap.add_argument("--salt", action="append", default=[], help="额外的盐候选（可重复），例如客户端 IP")
+    ap.add_argument("--mac", action="append", default=[],
+                    help="MAC 地址候选（可重复）。校园网 IP 绑 MAC 时盐往往就是它；"
+                         "各写法变体（冒号/横杠/无分隔、大小写）自动展开")
     ap.add_argument("--salt-file", help="一行一个盐候选的文件")
     args = ap.parse_args()
 
@@ -91,6 +107,8 @@ def main():
     if args.salt_file:
         with open(args.salt_file, encoding="utf-8") as f:
             salts += [l.strip() for l in f if l.strip()]
+    for m in args.mac:
+        salts += mac_variants(m)
 
     cands = build_candidates(args.plain, args.user, args.host, salts)
     hits = [(k, v) for k, v in cands.items() if v == args.target]
@@ -99,7 +117,8 @@ def main():
     print("明文     : %s（%d 字符）" % (args.plain, len(args.plain)))
     print("账号     : %s" % (args.user or "（未给）"))
     print("门户     : %s" % (args.host or "（未给）"))
-    print("盐候选   : %s" % (", ".join(salts) if salts else "（未给 —— 若要试客户端 IP，用 --salt 传进来）"))
+    print("盐候选   : %s" % (", ".join(salts[:14]) + ("…" if len(salts) > 14 else "")
+                              if salts else "（未给 —— 试客户端 IP 用 --salt，试 MAC 用 --mac）"))
     print("试过组合 : %d 种" % len(cands))
     print()
     if hits:
@@ -112,7 +131,8 @@ def main():
         print("  · 硬编码哈希只在 IP 不变时有效，换 IP/重拨就会失败")
         return 0
     print("❌ 没命中（常见拼法都在里面了）。下一步：")
-    print("   1) 把客户端 IP 传进来试：--salt <IP>（门户的 /api/ip.php 会告诉你它看到的 IP）")
+    print("   1) 把客户端 IP / MAC 传进来试：--salt <IP> --mac <AA:BB:CC:DD:EE:FF>")
+    print("      （门户的 /api/ip.php 会告诉你它看到的 IP；MAC 用 ip link show wan | grep ether）")
     print("   2) 还不行就是页面下发的随机盐 → 必须拿到认证页的 JS：")
     print("      curl -s http://门户地址/ -o /tmp/p.html && grep -oE 'src=\"[^\"]+\\.js[^\"]*' /tmp/p.html")
     print("      curl -s http://门户地址/ | grep -n 'md5\\|encrypt\\|pass' | head")

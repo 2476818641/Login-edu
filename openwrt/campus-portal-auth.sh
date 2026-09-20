@@ -12,7 +12,20 @@
 #   POST /api/stat.php          → {"ret":0,"data":[],"msg":"认证成功！"}
 #
 #   三条 POST 的 body 完全相同：
-#     user=<账号>&pass=<MD5>&authmode=0&pool=&isp_id=0&pxyacct=
+#     user=<账号>&pass=<32位hex>&authmode=0&pool=&isp_id=0&pxyacct=
+#
+#   失败样本（第二次抓包实测，故意输错密码两次）：
+#     {"ret":4,"data":{"type":0},"msg":"帐号密码不正确！"}   ← ret=4 就是密码错
+#   认证成功后浏览器跳去 baidu.com：那是**页面 JS 自己跳的**（门户响应里没有任何 302/Location），
+#     脚本不需要模拟这一步，能通外网就算成功。
+#
+# ⚠️ 唯一没定的事：pass 的哈希输入。同一账号两次成功登录提交的值**不同**：
+#     18:25  pass=c88a20f6682da8c8f88f4f2f384400c6
+#     18:58  pass=c3d33fb1c9bd665c5145226b23531e36
+#   若这期间密码没改过 ⇒ 哈希里掺了"每次都变"的东西（页面里下发的盐/challenge），
+#   那么 pass_mode=md5 不够用，得按认证页 JS 的算法来（例如 md5(盐+明文)）。
+#   处理顺序：先 --hash-test 对比抓包里的值 → 对上就用对应 pass_mode；
+#             对不上就把认证页 HTML/JS（GET http://门户地址/ 及其引用的 js）发来。
 #
 # 换学校怎么办：这个门户是"通用型"的（三步路径 / 字段名 / 固定字段 / 哈希方式全部可配），
 #   正常情况只改 uci 就够了，不必改脚本：
@@ -247,7 +260,14 @@ for _path in $(printf '%s' "$API_PATHS" | tr ',' ' '); do
 	say "  [$STEP] $_path → ret=${RET:-?} msg=${MSG:-（空）}${TYPE:+ type=$TYPE}"
 	LAST_MSG="$MSG"; LAST_RET="$RET"; LAST_TYPE="$TYPE"
 	if [ -n "$RET" ] && [ "$RET" != 0 ]; then
-		say "认证被拒绝：$_path 返回 ret=$RET msg=$MSG"
+		# 失败码对照（来自 2026-09-20 第二次抓包，两条错密码实测）：
+		#   ret=4 → msg「帐号密码不正确！」（密码错；两次错密码都是 4）
+		#   其它非 0 → 原样打印，等补抓样本再对照
+		case "$RET" in
+			4) say "认证被拒绝：账号或密码不正确（ret=4 msg=$MSG）"
+			   say "  → 先用 --hash-test 核对哈希方式；账号本身没错的话基本就是哈希算错了" ;;
+			*) say "认证被拒绝：$_path 返回 ret=$RET msg=$MSG" ;;
+		esac
 		log "auth rejected at step $STEP ($_path): ret=$RET msg=$MSG"
 		FAILED=1
 		break

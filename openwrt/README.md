@@ -147,6 +147,7 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 | 已经在线 | 直接 `exit 0`，什么都不做（幂等，cron 反复跑没事） |
 | `--force` | 强制走一次登录流程 |
 | `--hash-test` | 打印各候选哈希；**只能和同一账号的抓包比对**（账号换了就不能比） |
+| `--diag` | 自检：uci 能不能读能写、每个参数从哪来、密码到底读到没有（排查"配置没生效"第一命令） |
 | `--quiet` | 不输出（hotplug / cron 用） |
 | 参数来源 | 环境变量优先，其次 `uci get campus.main.{auth_url,api_paths,user,pass,pass_mode,...}` |
 

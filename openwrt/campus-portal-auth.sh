@@ -44,6 +44,7 @@
 #   campus-portal-auth.sh --quiet         # 静默（给 hotplug / cron 用）
 #   campus-portal-auth.sh --setup         # 交互填门户地址/账号/密码/哈希方式，存进 uci campus
 #   campus-portal-auth.sh --hash-test     # 打印各种候选 MD5，用来和抓包里的 pass= 对比
+#   campus-portal-auth.sh --diag          # 自检：uci 能不能读能写、参数到底从哪来、密码读到没有
 #   campus-portal-auth.sh --install-hook  # 装「WAN 上线自动认证 + 每 5 分钟兜底」
 #   campus-portal-auth.sh --uninstall-hook# 卸掉上面两样
 #
@@ -87,6 +88,43 @@ md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 
 # ---------------------------------------------------------------- 子命令
 case "${1:-}" in
+--diag|--show-config)
+	echo "== 环境 =="
+	echo "  脚本: $SELF"
+	echo "  uci : $(command -v uci 2>/dev/null || echo '（没有！不是路由器？）')   HAS_UCI=$HAS_UCI"
+	echo "  配置文件: $CONF $([ -f "$CONF" ] && echo '（存在）' || echo '（不存在）')"
+	[ "$HAS_UCI" = 1 ] && { echo; echo "== uci show campus =="; uci show campus 2>&1 | sed 's/^/  /' || true; }
+	[ -f "$CONF" ] && { echo; echo "== $CONF =="; sed 's/^/  /' "$CONF"; }
+	echo; echo "== /etc/config/campus 与磁盘 =="
+	ls -l /etc/config/campus 2>&1 | sed 's/^/  /' || true
+	df -h /overlay /etc 2>/dev/null | sed 's/^/  /' || true
+	if [ "$HAS_UCI" = 1 ]; then
+		echo; echo "== uci 写入自检（写个临时键再读回来）=="
+		if uci set campus.main.__probe=1 2>&1 | sed 's/^/  /' && uci commit campus 2>&1 | sed 's/^/  /'; then
+			PB="$(uci -q get campus.main.__probe)"
+			uci -q delete campus.main.__probe 2>/dev/null; uci -q commit campus 2>/dev/null
+			if [ "$PB" = 1 ]; then
+				echo "  ✅ uci 可读可写（那 --setup 保存失败就不是 uci 的问题）"
+			else
+				echo "  ❌ 写进去了但读回来是「${PB:-空}」→ commit 没落地（overlay 满/只读/配置损坏）"
+			fi
+		else
+			echo "  ❌ uci set/commit 直接失败（看上面报错）"
+		fi
+	fi
+	echo; echo "== 脚本实际取到的参数（来源：环境变量/配置文件 > uci > 默认）=="
+	env_or_uci PORTAL      campus.main.auth_url  ''
+	env_or_uci CAMPUS_USER campus.main.user      ''
+	env_or_uci CAMPUS_PASS campus.main.pass      ''
+	env_or_uci PASS_MODE   campus.main.pass_mode 'md5'
+	env_or_uci API_PATHS   campus.main.api_paths ''
+	printf '  门户地址 : %s\n' "${PORTAL:-（空！跑 --setup）}"
+	printf '  账号     : %s\n' "${CAMPUS_USER:-（空！）}"
+	printf '  密码     : %s\n' "$([ -n "$CAMPUS_PASS" ] && echo "已读到（${#CAMPUS_PASS} 字符）" || echo '（空！← 这就是 --hash-test 说"还没配密码"的原因）')"
+	printf '  哈希方式 : %s\n' "${PASS_MODE:-md5}"
+	printf '  认证路径 : %s\n' "${API_PATHS:-（用脚本内置默认）}"
+	exit 0
+	;;
 --setup)
 	[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
 	printf '门户地址（浏览器打开认证页时的地址，例如 http://10.30.100.5，也可只填 IP）: '; read -r A
@@ -102,15 +140,19 @@ case "${1:-}" in
 		*) echo "门户地址没带协议，已按 $A 处理" ;;
 	esac
 	if [ "$HAS_UCI" = 1 ]; then
-		uci -q set campus.main='main'
-		[ -n "$A" ] && uci -q set "campus.main.auth_url=$A"
-		[ -n "$U" ] && uci -q set "campus.main.user=$U"
-		[ -n "$P" ] && uci -q set "campus.main.pass=$P"
-		[ -n "${M:-}" ] && uci -q set "campus.main.pass_mode=$M"
-		[ -n "${PATHS:-}" ] && uci -q set "campus.main.api_paths=$PATHS"
-		[ -n "${EX:-}" ] && uci -q set "campus.main.extra_fields=$EX"
+		# 这里**故意不加 -q**：错误信息必须能看见（历史教训：-q 把报错吞了，
+		# 脚本还照样打印"已保存"，用户完全不知道没存进去）
+		SETFAIL=0
+		uci set campus.main='main' || SETFAIL=1
+		[ -n "$A" ] && { uci set "campus.main.auth_url=$A" || SETFAIL=1; }
+		[ -n "$U" ] && { uci set "campus.main.user=$U" || SETFAIL=1; }
+		[ -n "$P" ] && { uci set "campus.main.pass=$P" || SETFAIL=1; }
+		[ -n "${M:-}" ] && { uci set "campus.main.pass_mode=$M" || SETFAIL=1; }
+		[ -n "${PATHS:-}" ] && { uci set "campus.main.api_paths=$PATHS" || SETFAIL=1; }
+		[ -n "${EX:-}" ] && { uci set "campus.main.extra_fields=$EX" || SETFAIL=1; }
+		[ "$SETFAIL" = 0 ] || { echo "❌ uci set 失败（看上面报错）" >&2; exit 1; }
 		# 关键：commit 之后**读回来核对**，不能像以前那样不管成败都打印"已保存"
-		if ! uci -q commit campus; then
+		if ! uci commit campus; then
 			echo "❌ uci commit campus 失败（配置没保存）" >&2
 			exit 1
 		fi

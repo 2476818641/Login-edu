@@ -1,116 +1,122 @@
 # OpenWrt / ImmortalWrt 路由器 · 校园网自动登录
 
-一套脚本，把"路由器插上校园网就能上网"这件事做完整：
+**两个脚本，各管一件事**：
 
-```
-campus-net-setup.sh     一键配置：接入方式 + MAC克隆 + TTL + MTU + UA + 账号密码入库 + 可选装自动认证
-campus-portal-auth.sh   网页认证脚本（骨架，按自己学校的抓包填 3 处；幂等、失败非 0）
-campus-portal-autologin.sh  WAN 一上线自动认证（装到 /etc/hotplug.d/iface/）+ cron 每 5 分钟兜底
-PACKET-CAPTURE.md       抓包清单：按这份抓一次，就能把认证脚本填成正式版
-```
+| 脚本 | 干什么 | 需要抓包吗 |
+|---|---|---|
+| **`campus-net-setup.sh`**（主脚本） | 探测现状 → 问接入方式 → 配 **MAC 克隆 / TTL / MTU / UA(UA2F)** → **PPPoE 拨号** → 等 20 秒测外网、报告结果。**不实现网页认证** | 不需要，装上就能跑 |
+| **`campus-portal-auth.sh`**（认证脚本） | 网页认证：提交账号密码、判定成功、装成开机自动登录（`--install-hook`） | **需要**：标了 3 处「← 抓包」，按你学校抓包填（把抓包交给 AI 一般能直接生成） |
 
-适用：OpenWrt 21.02+ / ImmortalWrt（含 apk 版 25.x）。有线 WAN、PPPoE、**WiFi STA 无线上联**都覆盖。
+`PACKET-CAPTURE.md` 是抓包清单；有线 WAN、PPPoE、**WiFi STA 无线上联**都覆盖。
 
 ---
 
-## 使用流程（完整）
+## 完整流程
 
-### 第 0 步：环境前提
-
-- 路由器能 SSH（`root@192.168.1.1`），固件里至少有 `curl`（ImmortalWrt 默认有）
-- 有线还是无线？无线（STA 连校园 AP）也可以，只要满足：
-  **wwan 是独立接口 + LAN 是另一个网段 + NAT**（路由模式）。
-  ⚠️ 用 relayd / WDS 把 wwan 桥进 br-lan 的**桥接中继不行** —— 流量走二层、不过 IP 栈，
-  UA2F 与 TTL 改写都会失效。脚本会检测并警告这种情况。
-
-### 第 1 步：抓一次认证包（关键）
-
-按 [`PACKET-CAPTURE.md`](PACKET-CAPTURE.md) 用 Burp/F12 抓一次**登录**请求（最好再抓一次**密码错**的），
-拿到：认证接口 URL、字段名、成功标志。
-
-### 第 2 步：把认证脚本填成正式版
-
-编辑 `/etc/campus-portal-auth.sh`，只有 3 处标了 `← 抓包`：
-
-```sh
-AUTH_URL='http://10.10.10.10:801/srun_portal'   # ① 认证接口（含端口）
-...
---data-urlencode "user=$CAMPUS_USER" \          # ② 字段名照抄抓包（user? username? 学号字段名?）
---data-urlencode "pass=$CAMPUS_PASS" \
-...
-*'"result":"1"'*)                               # ③ 成功标志（响应里出现什么算成功）
-```
-
-如果抓包里发现**先 GET 一次认证页拿 cookie/token**，把脚本里那行注释掉的 `curl_auth -c "$COOKIE" "$AUTH_URL"` 打开。
-如果有 **`sign`/`token`/密码加密**，把对应 JS 一并拿出来，我可以帮你补上算法。
-
-### 第 3 步：一键配置
+### 第 1 步：先用主脚本把"底层"配好
 
 ```sh
 B=https://raw.githubusercontent.com/2476818641/Login-edu/main/openwrt
-# 国内可用自己的 ghproxy 加速，例如：
-#   B=https://cf.liuass.eu.org/ghproxy/https://raw.githubusercontent.com/2476818641/Login-edu/main/openwrt
+# 国内可套自己的 ghproxy：B=https://cf.liuass.eu.org/ghproxy/$B
 
-wget -O /tmp/campus-net-setup.sh   $B/campus-net-setup.sh
-wget -O /tmp/campus-portal-auth.sh $B/campus-portal-auth.sh
+wget -O /tmp/campus-net-setup.sh $B/campus-net-setup.sh
 DRY_RUN=1 sh /tmp/campus-net-setup.sh      # 先干跑：只看要改什么，不落盘、不断网
 sh /tmp/campus-net-setup.sh                # 正式跑
 ```
 
-脚本会依次问：
+它会依次问：
 
 | 提示 | 说明 |
 |---|---|
-| 接入方式 | `1` PPPoE ／ `2` 网页认证 ／ `3` 我已经用 WiFi 连上校园网了（无线上联） |
-| 认证账号 / 密码 / 认证接口地址 | 网页认证模式才问；存进 `uci campus`（`/etc/config/campus`，权限 600） |
-| 要克隆的 MAC | 回车=不改；`auto`=取 `/tmp/dhcp.leases` 第一台设备；或直接填 `AA:BB:CC:DD:EE:FF` |
-| MTU | PPPoE 默认 1492，网页认证 1500，无线上联默认 `keep` |
-| 启用 UA2F / 自定义 UA / 443 / 内网 | 自定义 UA 支持 `keep`、`empty`、`win`（常见 Chrome UA）或直接粘贴整串 |
-| 装自动认证吗 | `y` → 写 hotplug + cron 每 5 分钟兜底 |
+| 接入方式 | `1` PPPoE（本脚本直接配好账号密码并拨号）／`2` 网页认证（只配网络，认证交给认证脚本）／`3` 我已经用 WiFi 连上校园网了 |
+| 选 `3` 之后的认证方式 | **WiFi 上联一样要认证**：`1` 网页认证（默认）／`2` PPPoE／`3` 不用认证（家里测试） |
+| 要克隆的 MAC | 回车=不改；`auto`=取 `/tmp/dhcp.leases` 第一台设备；或填 `AA:BB:CC:DD:EE:FF` |
+| MTU | PPPoE 默认 1492，网页认证 1500，无线上联默认 `keep`（由 AP 决定） |
+| UA2F / 自定义 UA / 443 / 内网 | 自定义 UA 支持 `keep`、`empty`、`win`（常见 Chrome UA）或直接粘贴整串 |
 
-它会做这些事（都在 UCI/配置层，可回滚）：
+它改了什么（都可回滚）：
 
 | 项 | 落点 | 回滚 |
 |---|---|---|
 | MAC 克隆 | `config device` 段（与 LuCI「网络→接口→设备」一致） | LuCI 删掉 MAC 字段 |
 | MTU / MRU | `network.<iface>.mtu` / `.mru` | `uci delete ...` |
-| 接入方式 | `network.<iface>.proto`（pppoe + 账号密码 / dhcp） | 改回 dhcp |
-| **TTL** | `/etc/nftables.d/10-ttl-fix.nft`（除 LAN 网桥外所有出口改回 64） | `rm` 该文件 + `fw4 reload` |
-| UA | `ua2f.enabled/s.*`（`handle_fw` 强制开） | LuCI「网络→UA2F」 |
-| 认证参数 | `uci campus`（user/pass/auth_url/iface） | `uci delete campus.main` |
+| 接入方式 | `network.<iface>.proto`（pppoe + 账号密码 / dhcp） | 改回 `dhcp` |
+| **TTL** | `/etc/nftables.d/10-ttl-fix.nft`（**除 LAN 网桥外所有出口**改回 64） | `rm` 该文件 + `fw4 reload` |
+| UA | `ua2f.*`（`handle_fw` 强制开，否则 ua2f 不建规则链） | LuCI「网络→UA2F」 |
 
 > `/etc/nftables.d/` 在 firewall4 的 keep.d 里，**刷固件升级后 TTL 规则仍在**。
+> 规则用"排除 LAN 网桥"而不是写死设备名，所以网线 / PPPoE / 无线 STA 都自动覆盖。
 
-### 第 4 步：装自动认证（也可以在配置时选 y）
+跑完它会等 20 秒，然后 `ping 223.5.5.5` 或 `curl baidu.com` 测一次：
+
+- **通了** → 收工（网页认证模式下若直接通，说明学校放行或已认证过）
+- **没通 + PPPoE** → 提示去看 `logread` 里的 pppd 报错
+- **没通 + 网页认证（有线上联和无线都一样）** → 探出认证页地址，并让你去做第 2 步
+
+### 第 2 步：网页认证脚本（需要抓包）
 
 ```sh
+# 1) 抓一次登录包（含一次故意输错密码），清单见 PACKET-CAPTURE.md
+# 2) 把抓包交给 AI → 生成/补全 campus-portal-auth.sh（或自己按「← 抓包」填 3 处）
+# 3) 装上去
 B=https://raw.githubusercontent.com/2476818641/Login-edu/main/openwrt
-wget -O /etc/campus-portal-auth.sh        $B/campus-portal-auth.sh && chmod +x /etc/campus-portal-auth.sh
-wget -O /etc/hotplug.d/iface/99-campus-portal $B/campus-portal-autologin.sh && chmod +x /etc/hotplug.d/iface/99-campus-portal
-echo '*/5 * * * * /etc/campus-portal-auth.sh --quiet' >> /etc/crontabs/root
-/etc/init.d/cron restart
+wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/campus-portal-auth.sh
+
+# 4) 填账号密码与认证地址（存进 /etc/config/campus，权限 600）
+/etc/campus-portal-auth.sh --setup
+
+# 5) 手动跑一次验证
+/etc/campus-portal-auth.sh
+
+# 6) 装成自动：WAN 一上线就认证 + 每 5 分钟兜底
+/etc/campus-portal-auth.sh --install-hook
 ```
 
-### 第 5 步：验证
-
-```sh
-/etc/campus-portal-auth.sh            # 手动跑一次，应输出「认证成功 ✅」
-logread | grep campus-portal          # 看自动登录的日志
-reboot                                # 重启后应自动登录（hotplug 触发）
-```
-
----
-
-## 契约（自己写认证脚本也照这个来）
+认证脚本的约定（自己改也照这个来）：
 
 | 约定 | 说明 |
 |---|---|
 | 成功 | `exit 0`，**并且外网真的能通** |
-| 失败 | `exit 非 0`（调用方会重试 3 次） |
-| 已经在线 | 直接 `exit 0`，什么都不做（幂等，方便定时任务反复跑） |
+| 失败 | `exit 非 0`（hotplug 会重试 3 次） |
+| 已经在线 | 直接 `exit 0`，什么都不做（幂等，cron 反复跑没事） |
 | `--force` | 强制走一次登录流程 |
-| `--quiet` | 不往 stdout 输出（给 hotplug/cron 用） |
-| 参数来源 | 环境变量优先，其次 `uci get campus.main.{auth_url,check_url,user,pass,ua,iface}` |
+| `--quiet` | 不输出（hotplug / cron 用） |
+| 参数来源 | 环境变量优先，其次 `uci get campus.main.{auth_url,user,pass,check_url,ua,iface}` |
+
+### 第 3 步：验证
+
+```sh
+/etc/campus-portal-auth.sh          # 手动：应输出「认证成功 ✅」
+logread | grep campus-portal        # 自动登录日志
+reboot                              # 重启后应自动认证（hotplug 触发），掉线由 cron 补
+```
+
+---
+
+## WiFi（STA）上联特别说明
+
+| 事项 | 说明 |
+|---|---|
+| **一样要认证** | 校园无线通常也是网页认证（Dr.COM / 深澜），主脚本选 `3` 时会再问一次认证方式，别默认以为"无线就放行" |
+| 必须是**路由模式** | `wwan` 独立接口 + 另一个网段 + NAT。用 relayd/WDS 桥进 `br-lan` 的桥接中继**不行**——流量走二层、不过 IP 栈，UA2F 与 TTL 都失效（主脚本会检测并告警） |
+| MAC 克隆 | 无线的 MAC 要写在 `wireless` 的 `wifi-iface` 上：`uci set wireless.<STA段>.macaddr='...'`；MTK 私有驱动可能有限制，改完用 `iw dev <设备> info` 核对并确认还能关联 |
+| MTU | 由 AP 决定，主脚本默认 `keep` |
+| 认证接口要 `mac` 参数 | 用克隆上去的那个 MAC（抓包时留意 body 里有没有 `mac=`） |
+| 掉线重连 | STA 重连后常常要重新认证 —— 这正是 `--install-hook` 的 cron 兜底存在的理由 |
+
+STA 还没建好的最小配置（SSID/密码换成你自己的）：
+
+```sh
+uci set wireless.sta=wifi-iface
+uci set wireless.sta.device=radio0
+uci set wireless.sta.mode=sta
+uci set wireless.sta.ssid='校园网 SSID'
+uci set wireless.sta.encryption=none     # 校园网多为开放+网页认证；有密码就写 psk2 并补 key
+uci set wireless.sta.network=wwan
+uci set network.wwan=interface
+uci set network.wwan.proto=dhcp
+uci commit wireless; uci commit network; wifi reload; /etc/init.d/network restart
+```
 
 ---
 
@@ -118,19 +124,17 @@ reboot                                # 重启后应自动登录（hotplug 触�
 
 | 现象 | 原因 / 解决 |
 |---|---|
+| 主脚本跑完不通（网页认证） | 正常，认证不在主脚本里做 —— 去做第 2 步（抓包生成认证脚本） |
 | 认证脚本跑了但还不通 | ① 字段名/成功标志与抓包不一致 ② 需要先 GET 拿 cookie/token ③ 认证页在内网、被 UA2F 改了 UA → `uci set ua2f.firewall.handle_intranet=0; uci commit ua2f; /etc/init.d/ua2f restart` ④ 账号已在别处登录 |
-| TTL 改了但被检测到 | 确认规则生效：`nft list chain inet fw4 ttl_fix`（应能看到 `ip ttl set 64`）；若你的 WAN 也是网桥，把它的名字从规则排除列表里去掉 |
-| 无线上联时 MAC 没变 | WiFi 的 MAC 要写在 wireless 的 `wifi-iface` 上：`uci set wireless.<STA段>.macaddr='...'`；MTK 私有驱动可能限制，改完用 `iw dev <sta设备> info` 核对，并确认还能关联上 AP |
-| UA2F 开着但 UA 没变 | 检查 `ua2f.firewall.handle_fw=1`（关着就完全不建规则链）；浏览器打开 <http://ua-check.stagoh.com/> 验证 |
-| 桥接中继（relayd/WDS） | 必须改成**路由模式**：wwan 单独接口 + 另一个网段 + NAT；桥接走二层，UA2F/TTL 都不会生效 |
-| 无线 STA 没建好 | 见主脚本结尾打印的最小 uci 命令（`wireless.sta` + `network.wwan`） |
+| TTL 改了还被检测 | `nft list chain inet fw4 ttl_fix` 看规则在不在；若你的 WAN 也是网桥，把它从规则排除列表里去掉 |
+| UA2F 开着但 UA 没变 | 检查 `ua2f.firewall.handle_fw=1`；浏览器打开 <http://ua-check.stagoh.com/> 验证 |
+| 想改回原样 | 删 `/etc/nftables.d/10-ttl-fix.nft` + `fw4 reload`；LuCI 里把 MAC/MTU 去掉；`/etc/campus-portal-auth.sh --uninstall-hook` |
 
 ## 卸载
 
 ```sh
-rm -f /etc/hotplug.d/iface/99-campus-portal
-sed -i '/campus-portal-auth.sh/d' /etc/crontabs/root && /etc/init.d/cron restart
-rm -f /etc/campus-portal-auth.sh
+/etc/campus-portal-auth.sh --uninstall-hook
+rm -f /etc/campus-portal-auth.sh /etc/nftables.d/10-ttl-fix.nft && fw4 reload
 uci delete campus.main; uci commit campus
 ```
 

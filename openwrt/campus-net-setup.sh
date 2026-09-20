@@ -1,29 +1,33 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# campus-net-setup.sh —— 校园网接入一键配置（防识别四件套：MAC / TTL / MTU / UA + PPPoE / 网页认证）
+# campus-net-setup.sh —— 校园网接入配置（主脚本）
+#
+# 只做两件事：**配置** + **PPPoE 拨号**。网页认证不在这里，见同目录 campus-portal-auth.sh。
 #
 # 做什么：
-#   1) 问接入方式：PPPoE / 网页认证（要验证脚本）/ 我已经用 WiFi 连上了校园网
-#   2) 配好上网口的 MAC 克隆、TTL（默认 64）、MTU、UA（UA2F）并生效
-#   3) 等 20 秒，ping / curl 试外网
-#   4) 不通且是网页认证 → 调用验证脚本登录 → 再测
+#   1) 探测现状：上网接口 / 默认路由 / MAC / MTU / TTL 规则 / UA2F
+#   2) 问接入方式：1) PPPoE（配好账号密码并拨号）  2) 网页认证（只配网络，认证交给认证脚本）
+#      3) 用 WiFi（STA）连校园网——**WiFi 上联同样要认证**，所以选 3 之后还会问一次认证方式
+#   3) 配好上网口的 MAC 克隆、TTL（默认 64）、MTU、UA（UA2F）并生效
+#   4) 等 20 秒，ping / curl 试外网，报告结果（网页认证模式下会顺带把认证页地址探出来）
 #
 # 用法：
 #   sh campus-net-setup.sh                  # 交互式
 #   DRY_RUN=1 sh campus-net-setup.sh        # 只打印要做的改动，不落盘、不断网
 #   WAIT_SECS=30 sh campus-net-setup.sh     # 改等待秒数（默认 20）
-#   WANIF=wwan sh campus-net-setup.sh       # 指定上网接口（默认自动探测 wan / wwan）
+#   WANIF=wwan sh campus-net-setup.sh       # 指定上网接口（默认按默认路由自动探测）
+#   TTL_VALUE=128 sh campus-net-setup.sh    # 改 TTL 目标值（默认 64）
 #
 # 非交互（可选）：
 #   CAMPUS_MODE=pppoe CAMPUS_USER=学号 CAMPUS_PASS=密码 sh campus-net-setup.sh
-#   CAMPUS_MODE=portal PORTAL_SCRIPT=/etc/campus-portal-auth.sh sh campus-net-setup.sh
+#   CAMPUS_MODE=portal sh campus-net-setup.sh
 #
 # 只改 UCI 配置 + 一个 /etc/nftables.d 里的 nft 规则文件，不装任何软件包。
 # /etc/nftables.d/ 在 firewall4 的 keep.d 里，所以刷固件升级后 TTL 规则仍在。
 #
-# 无线上网（STA）注意：必须"路由模式"（wwan 独立接口 + NAT），
-# 不能用 relayd/WDS 那种桥接中继 —— 桥接是二层转发、不过 IP 栈，UA2F 与 TTL 都不会生效。
+# 无线上网（STA）注意：必须是"路由模式"（wwan 独立接口 + NAT），不能用 relayd/WDS 桥接中继 ——
+# 桥接是二层转发、不过 IP 栈，UA2F 与 TTL 改写都不会生效（脚本会检测并告警）。
 
 set -u
 
@@ -32,11 +36,7 @@ WAIT_SECS="${WAIT_SECS:-20}"
 TTL_VALUE="${TTL_VALUE:-64}"
 TTL_FILE="${TTL_FILE:-/etc/nftables.d/10-ttl-fix.nft}"
 SYSFS="${SYSFS:-/sys/class/net}"		# 可覆盖，便于测试
-HOOKDIR="${HOOKDIR:-/etc/hotplug.d/iface}"
-CRONTAB_FILE="${CRONTAB_FILE:-/etc/crontabs/root}"
-AUTH_SCRIPT="${AUTH_SCRIPT:-/etc/campus-portal-auth.sh}"
 LOG_TAG="campus-setup"
-PORTAL_SCRIPT="${PORTAL_SCRIPT:-}"
 CAMPUS_MODE="${CAMPUS_MODE:-}"
 
 msg()  { printf '%s\n' "$*"; }
@@ -60,11 +60,11 @@ uget() { uci -q get "$1" 2>/dev/null; }
 [ "$(id -u)" = 0 ] || die "请用 root 运行（需要改网络与防火墙配置）"
 command -v uci >/dev/null 2>&1 || die "找不到 uci —— 这个脚本要在 OpenWrt 路由器上运行"
 
-# ---------------------------------------------------------------- 探测现状
+# ---------------------------------------------------------------- 0) 探测现状
 # 上网接口怎么定（优先级从高到低）：
 #   1) WANIF 环境变量
-#   2) 默认路由的出口设备反查 UCI 接口 —— 这是最准的：无线上联时会自动认出 wwan（设备 apclix0 之类）
-#   3) 兜底：wan 有设备就用 wan，否则 wwan，再否则 wan
+#   2) 默认路由的出口设备反查 UCI 接口 —— 最准：无线上联时会认出 wwan（设备 apclix0 之类）
+#   3) 兜底：wan 有设备就用 wan，否则 wwan
 DEFDEV_RAW="$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')"
 DEFDEV_BASE="${DEFDEV_RAW#pppoe-}"	# pppoe-wan -> wan
 if [ -z "${WANIF:-}" ] && [ -n "$DEFDEV_BASE" ]; then
@@ -82,7 +82,6 @@ fi
 WANDEV="$(uget network.$WANIF.device)"; [ -z "$WANDEV" ] && WANDEV="$(uget network.$WANIF.ifname)"
 WANDEV="${WANDEV%% *}"; [ -z "$WANDEV" ] && WANDEV="$WANIF"
 OLD_PROTO="$(uget network.$WANIF.proto)"
-DEFDEV="$DEFDEV_RAW"
 
 # LAN 侧网桥：TTL 规则排除它们，其余出口一律改写 → 网线 / PPPoE / 无线 STA 通吃
 LAN_DEVS=""
@@ -91,8 +90,7 @@ for _s in $(uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)\.type='
 	[ -n "$_n" ] && LAN_DEVS="$LAN_DEVS \"$_n\","
 done
 [ -z "$LAN_DEVS" ] && LAN_DEVS=' "br-lan",'
-LAN_DEVS="${LAN_DEVS%,}"
-LAN_DEVS="${LAN_DEVS# }"
+LAN_DEVS="${LAN_DEVS%,}"; LAN_DEVS="${LAN_DEVS# }"
 
 info "当前状态"
 msg "    上网接口     : network.$WANIF（设备 $WANDEV，proto ${OLD_PROTO:-未知}）$([ -n "$DEFDEV_BASE" ] && [ "$WANIF" != "wan" ] && echo '  ← 按默认路由反查出来的')"
@@ -105,13 +103,11 @@ if [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; then
 else
 	msg "    UA2F         : 未安装"
 fi
-# LAN 网桥设备名（用来判断无线上联是"路由模式"还是"桥接中继"）
+
+# LAN 网桥设备名（判断无线上联是"路由模式"还是"桥接中继"）
 LANBR=""
-for _i in lan; do
-	_d="$(uget network.$_i.device)"; [ -n "$_d" ] && LANBR="${_d%% *}"
-done
+_d="$(uget network.lan.device)"; [ -n "$_d" ] && LANBR="${_d%% *}"
 [ -z "$LANBR" ] && LANBR="br-lan"
-# 出口设备是不是 LAN 网桥的成员端口？是 → 桥接中继（UA2F/TTL 都会失效）
 if [ -n "$DEFDEV_RAW" ] && [ -e "$SYSFS/$LANBR/brif/$DEFDEV_RAW" ]; then
 	warn "默认路由出口 $DEFDEV_RAW 是 LAN 网桥 $LANBR 的成员端口 → 这是**桥接中继**："
 	msg "         流量走二层、不过 IP 栈，UA2F 和 TTL 改写都不会生效。"
@@ -119,21 +115,20 @@ if [ -n "$DEFDEV_RAW" ] && [ -e "$SYSFS/$LANBR/brif/$DEFDEV_RAW" ]; then
 elif [ -n "$DEFDEV_RAW" ]; then
 	case "$DEFDEV_RAW" in
 	*sta*|wlan*|ra[0-9]*|apcl*)
-		msg "    无线上联   : $DEFDEV_RAW（路由模式 ✅ —— 独立的 network.$WANIF + 本身是另一个网段）"
-		;;
+		msg "    无线上联   : $DEFDEV_RAW（路由模式 ✅ —— 独立的 network.$WANIF + 本身是另一个网段）" ;;
 	esac
 fi
 if [ "$WANIF" = "wan" ] && [ -r "$SYSFS/$WANDEV/carrier" ] && \
    [ "$(cat "$SYSFS/$WANDEV/carrier" 2>/dev/null)" = "0" ]; then
 	warn "网口 $WANDEV 没有链路（carrier=0）：如果你是靠 WiFi 上校园网，"
-	msg "         请用 WANIF=wwan sh 本脚本，或者选方式 3（脚本才知道该配哪个接口）"
+	msg "         请用 WANIF=wwan sh 本脚本，或者接入方式选 3（脚本才知道该配哪个接口）"
 fi
 
 # ---------------------------------------------------------------- 1) 接入方式
 info "1/4 选择接入方式"
 if [ -z "$CAMPUS_MODE" ]; then
-	msg "    1) PPPoE（要账号密码，拨号）"
-	msg "    2) 网页认证（DHCP 拿地址后，去认证页登录）"
+	msg "    1) PPPoE（要账号密码，本脚本直接配好并拨号）"
+	msg "    2) 网页认证（本脚本只配网络；认证用 campus-portal-auth.sh，需要先抓包生成）"
 	msg "    3) 我已经用 WiFi 连上校园网了（uplink 是无线 STA，出口走 wwan）"
 	ask "    你的方式" "2"
 	case "$REPLY" in
@@ -145,12 +140,25 @@ if [ -z "$CAMPUS_MODE" ]; then
 fi
 msg "    → $CAMPUS_MODE${WIFI_UPLINK:+（无线上网）}"
 
+# 是否需要额外的"门户认证"：PPPoE 自己就是认证；网页认证/无线上联要看学校
+AUTH_REQUIRED=1
+[ "$CAMPUS_MODE" = "pppoe" ] && AUTH_REQUIRED=0
+
 if [ -n "${WIFI_UPLINK:-}" ]; then
 	ask "    无线上网用哪个接口（已经建好的 STA 网络名）" "wwan"
 	WANIF="$REPLY"
 	WANDEV="$(uget network.$WANIF.device)"; [ -z "$WANDEV" ] && WANDEV="$WANIF"
-	ask "    无线 STA 的 SSID（不填=不改，仅确认用）" ""
-	[ -n "$REPLY" ] && msg "    已记录 SSID: $REPLY（脚本不改无线配置；没建好的话见文末命令）"
+	msg "    ⚠️ WiFi 上联一样要认证：校园无线通常也是网页认证（Dr.COM / 深澜那套）"
+	msg "      1) 网页认证（默认；认证脚本要按抓包生成）"
+	msg "      2) PPPoE（少数学校的无线也走拨号）"
+	msg "      3) 不用认证（家里测试 / 学校直接放行）"
+	ask "    无线上联的认证方式" "1"
+	case "$REPLY" in
+	2|pppoe|PPPoE) CAMPUS_MODE="pppoe"; AUTH_REQUIRED=0 ;;
+	3|none|no|无|不用) AUTH_REQUIRED=0 ;;
+	*) CAMPUS_MODE="portal"; AUTH_REQUIRED=1 ;;
+	esac
+	msg "    → 无线上联 + $CAMPUS_MODE（$([ "$AUTH_REQUIRED" = 1 ] && echo 需要认证 || echo 不需要认证)）"
 fi
 
 PPPOE_USER=""; PPPOE_PASS=""
@@ -159,26 +167,9 @@ if [ "$CAMPUS_MODE" = "pppoe" ]; then
 	[ -z "$PPPOE_USER" ] && { ask "    PPPoE 账号（学号）" ""; PPPOE_USER="$REPLY"; }
 	[ -z "$PPPOE_PASS" ] && { ask "    PPPoE 密码" ""; PPPOE_PASS="$REPLY"; }
 	[ -n "$PPPOE_USER" ] || die "PPPoE 账号不能为空"
-else
-	if [ -z "$PORTAL_SCRIPT" ]; then
-		msg "    网页认证需要一个「验证脚本」：拿地址 → 提交账号密码 → 判断结果。"
-		msg "    没有就先留空，脚本会探测出认证页地址给你（按回车跳过）。"
-		ask "    验证脚本路径" ""
-		PORTAL_SCRIPT="$REPLY"
-	fi
-	if [ -n "$PORTAL_SCRIPT" ] && [ ! -f "$PORTAL_SCRIPT" ]; then
-		warn "找不到 $PORTAL_SCRIPT —— 先继续配置，稍后放上去再手动跑一次"
-		PORTAL_SCRIPT=""
-	fi
-	# 认证用的账号密码 / 认证接口地址（都可留空，稍后用 uci 补）
-	PORTAL_USER="${CAMPUS_USER:-}"; PORTAL_PASS="${CAMPUS_PASS:-}"
-	AUTH_URL_IN="${AUTH_URL:-}"
-	[ -z "$PORTAL_USER" ] && { ask "    认证账号（学号，可留空稍后填）" "$(uget campus.main.user)"; PORTAL_USER="$REPLY"; }
-	[ -n "$PORTAL_USER" ] && [ -z "$PORTAL_PASS" ] && { ask "    认证密码" ""; PORTAL_PASS="$REPLY"; }
-	[ -z "$AUTH_URL_IN" ] && { ask "    认证接口地址（可留空，抓包后再填）" "$(uget campus.main.auth_url)"; AUTH_URL_IN="$REPLY"; }
 fi
 
-# ---------------------------------------------------------------- 2) 防识别四件套
+# ---------------------------------------------------------------- 2) 配 MAC / TTL / MTU / UA
 info "2/4 配置 MAC / TTL / MTU / UA"
 
 # --- 2.1 MAC 克隆
@@ -262,13 +253,12 @@ if [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; then
 		UA2F_ENABLED=1
 		msg "    自定义 UA 可填：keep=不改 / empty=清空用内置默认 / win=常见 Chrome UA / 或直接粘贴整串"
 		ask "    自定义 UA" "${CUR_UA:-keep}"
-		UA_NEW="$REPLY"
-		case "$UA_NEW" in
+		case "$REPLY" in
 		keep|KEEP) ;;
 		empty|EMPTY) run uci set ua2f.main.custom_ua='' ;;
 		win|WIN|chrome)
 			run uci set ua2f.main.custom_ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' ;;
-		*) run uci set "ua2f.main.custom_ua=$UA_NEW" ;;
+		*) run uci set "ua2f.main.custom_ua=$REPLY" ;;
 		esac
 		ask "    也处理 443 端口的明文 HTTP（handle_tls，校园网常在 443 上做检测）" "$CUR_TLS"
 		case "$REPLY" in 1|y|Y|yes|是) run uci set ua2f.firewall.handle_tls='1' ;; *) run uci set ua2f.firewall.handle_tls='0' ;; esac
@@ -303,16 +293,6 @@ else
 fi
 run uci commit network
 if [ -n "${UA2F_ENABLED:-}" ]; then run uci commit ua2f; fi
-if [ "$CAMPUS_MODE" = "portal" ]; then
-	run uci set campus.main='main'
-	[ -n "${PORTAL_USER:-}" ] && run uci set "campus.main.user=$PORTAL_USER"
-	[ -n "${PORTAL_PASS:-}" ] && run uci set "campus.main.pass=$PORTAL_PASS"
-	[ -n "${AUTH_URL_IN:-}" ] && run uci set "campus.main.auth_url=$AUTH_URL_IN"
-	run uci set "campus.main.iface=$WANIF"
-	run uci commit campus
-	[ "$DRY_RUN" = 1 ] || chmod 600 /etc/config/campus 2>/dev/null || true
-	msg "    认证参数已存到 uci campus（/etc/config/campus，权限 600）"
-fi
 
 if [ "$DRY_RUN" = 1 ]; then
 	printf '    [dry-run] /etc/init.d/network %s\n' "$([ "$OLD_PROTO" != "$NEW_PROTO" ] && echo restart || echo reload)"
@@ -337,43 +317,9 @@ else
 		fi
 	fi
 	log "applied: iface=$WANIF mode=$CAMPUS_MODE mac=${CLONE_MAC:-unchanged} mtu=${MTU:-unchanged} ttl=$TTL_VALUE ua2f=${UA2F_ENABLED:-none}"
-
-	if [ "$CAMPUS_MODE" = "portal" ]; then
-		ask "    装「WAN 上线自动认证 + 每 5 分钟兜底」吗（y/N）" "n"
-		case "$REPLY" in
-		y|Y|yes|是)
-			run mkdir -p "$HOOKDIR"
-			if [ "$DRY_RUN" = 1 ]; then
-				printf '    [dry-run] 写 %s/99-campus-portal（ifup 时调 %s）\n' "$HOOKDIR" "$AUTH_SCRIPT"
-				printf '    [dry-run] 往 %s 追加：*/5 * * * * %s --quiet\n' "$CRONTAB_FILE" "$AUTH_SCRIPT"
-			else
-				cat > "$HOOKDIR/99-campus-portal" <<-HOOK
-				#!/bin/sh
-				# campus-net-setup.sh 生成：WAN 一上线就调校园网认证脚本
-				# 完整版（带日志与重试）见仓库 scripts/campus-portal-autologin.sh
-				[ "\${ACTION:-}" = "ifup" ] || exit 0
-				case "\${INTERFACE:-}" in
-					wan|wwan) ;;
-					*) exit 0 ;;
-				esac
-				[ -x "$AUTH_SCRIPT" ] && ( sleep 5; "$AUTH_SCRIPT" --quiet ) &
-				HOOK
-				chmod +x "$HOOKDIR/99-campus-portal"
-				if ! grep -q "campus-portal-auth.sh" "$CRONTAB_FILE" 2>/dev/null; then
-					mkdir -p "$(dirname "$CRONTAB_FILE")"
-					echo "*/5 * * * * $AUTH_SCRIPT --quiet" >> "$CRONTAB_FILE"
-				fi
-				command -v /etc/init.d/cron >/dev/null 2>&1 && run /etc/init.d/cron restart
-				msg "    已装：$HOOKDIR/99-campus-portal + $CRONTAB_FILE 每 5 分钟兜底"
-				[ -x "$AUTH_SCRIPT" ] || warn "    还没放认证脚本：把它放到 $AUTH_SCRIPT 并 chmod +x"
-			fi
-			;;
-		*) msg "    跳过自动认证（随时可手动跑 $AUTH_SCRIPT）";;
-		esac
-	fi
 fi
 
-# ---------------------------------------------------------------- 4) 等 20 秒 → 测 → 认证
+# ---------------------------------------------------------------- 4) 等 20 秒 → 测
 info "4/4 等待 ${WAIT_SECS} 秒后检测外网"
 [ "$DRY_RUN" = 1 ] || sleep "$WAIT_SECS"
 
@@ -383,48 +329,41 @@ check_net() {
 	[ "$_c" = "200" ] && return 0
 	return 1
 }
-portal_url() {
-	curl -s -m 8 -o /dev/null -w '%{redirect_url}' \
-		http://connect.rom.miui.com/generate_204 2>/dev/null
-}
 
 if check_net; then
 	info "外网已通 ✅"
 	msg "    出口 IP : $(curl -s -m 8 http://ip.3322.net 2>/dev/null || echo 取不到)"
 	[ "${UA2F_ENABLED:-0}" = 1 ] && msg "    验 UA   : 浏览器打开 http://ua-check.stagoh.com/ 看 User-Agent 是否已统一"
+	if [ "${AUTH_REQUIRED:-1}" = 1 ]; then
+		msg "    提示     : 还没跑过网页认证，但外网已通（学校可能直接放行，或已认证过）"
+		msg "               要让它在掉线后自动补认证：campus-portal-auth.sh --install-hook"
+	fi
 else
 	warn "还没通"
-	if [ "$CAMPUS_MODE" = "portal" ]; then
-		U="$(portal_url)"
+	if [ "${AUTH_REQUIRED:-1}" = 1 ]; then
+		U="$(curl -s -m 8 -o /dev/null -w '%{redirect_url}' http://connect.rom.miui.com/generate_204 2>/dev/null)"
 		[ -n "$U" ] && msg "    认证页地址：$U"
-		if [ -n "$PORTAL_SCRIPT" ]; then
-			i=1
-			while [ "$i" -le 3 ]; do
-				info "运行验证脚本（第 $i 次）：$PORTAL_SCRIPT"
-				if [ -x "$PORTAL_SCRIPT" ]; then run "$PORTAL_SCRIPT"
-				else warn "    没有执行权限，改用 sh 跑（建议 chmod +x）"; run sh "$PORTAL_SCRIPT"; fi
-				[ "$DRY_RUN" = 1 ] && break
-				sleep 5
-				if check_net; then info "认证成功，外网已通 ✅"; log "portal auth ok after $i try"; break; fi
-				warn "    还是不通，重试…"
-				i=$((i + 1))
-			done
-			if ! check_net; then
-				warn "脚本跑了但还不通，常见原因："
-				msg "    1) 认证页在内网、被 UA2F 改了 UA → 把 ua2f.firewall.handle_intranet 设 0 再试"
-				msg "    2) MAC 没生效（无线上网要写在 wifi-iface 上）"
-				msg "    3) 账号已在别处登录，或需要先在认证页手动登一次"
-			fi
-		else
-			warn "没有验证脚本，只能帮你到这儿。去下一份骨架，填 3 处就能用（见文件里的「← 抓包」）："
-			msg "    wget -O /etc/campus-portal-auth.sh <仓库>/scripts/campus-portal-auth.sh && chmod +x /etc/campus-portal-auth.sh"
-			msg "    骨架会读 uci campus 里的账号密码与认证地址，也支持开机自动登录（campus-portal-autologin.sh）"
-			msg "    认证参数现在填也可以：uci set campus.main.auth_url=... / user=... / pass=..."
+		cat <<'EOF'
+    网页认证不在本脚本里做 —— 认证流程要按你学校的抓包来，见 campus-portal-auth.sh：
+
+      1) 抓一次登录包（清单：PACKET-CAPTURE.md，用 Burp 或浏览器 F12）
+      2) 把抓包交给 AI（或自己按「← 抓包」标注填）生成/补全 /etc/campus-portal-auth.sh
+      3) wget -O /etc/campus-portal-auth.sh <raw 链接> && chmod +x /etc/campus-portal-auth.sh
+      4) 手动验证一次：/etc/campus-portal-auth.sh
+      5) 装成开机自动登录：/etc/campus-portal-auth.sh --install-hook
+EOF
+		if [ -n "${WIFI_UPLINK:-}" ]; then
+			msg "    无线上联注意：认证接口有时要带 mac 参数，用你克隆上去的那个 MAC；"
+			msg "                  另外 STA 掉线重连后如果又不通，多半是要重新认证（--install-hook 的 cron 会补）"
 		fi
-	else
+	elif [ "$CAMPUS_MODE" = "pppoe" ]; then
 		warn "PPPoE 没拨上：检查账号密码、是否需要 VLAN、以及 VLAN ID"
 		msg "    看日志：logread | tail -30   （找 pppd 报错）"
 		msg "    看状态：ifstatus $WANIF | head -40"
+	else
+		warn "无线上联没通：先看是不是没关联上/没拿到地址"
+		msg "    看 STA 状态：iwinfo | head -20 ; ifstatus $WANIF | head -20"
+		msg "    如果学校是要认证的，把认证脚本装上：campus-portal-auth.sh（见 PACKET-CAPTURE.md）"
 	fi
 fi
 

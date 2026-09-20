@@ -2,6 +2,17 @@
 
 目标：抓一次登录，就能把 `campus-portal-auth.sh` 里的 3 处 `← 抓包` 一次填对。
 
+## 交付方式（选一个，都通）
+
+| 方式 | 怎么做 | 适合 |
+|---|---|---|
+| **① 直接给 Burp XML** | Burp → Proxy → HTTP history → 全选 → 右键 `Save items` → 存 `.xml` → 丢进 `captures/`（本机也可放 `/tmp/campus-capture/`）→ 告诉我文件名 | 最省事、一字不漏；几十 MB 我这边能处理 |
+| **② 压缩后贴给 AI** | `python3 tools/burp-xml-summary.py captures/xx.xml -o captures/小抄.md` → 小抄 + `captures/AI-PROMPT.md` 的提示词一起贴给任意 AI | 用在线 AI（上下文有限），脚本会自动脱敏 cookie/密码值 |
+| **③ 手抄关键报文** | 按下面「要交出来的内容」①②③抄 3 段原文 | 只想截图/手机上看两眼 |
+
+> 抓包里含**明文密码、学号、会话 cookie**：别提交进 git（`captures/.gitignore` 已挡住），贴给外部 AI 前先走方式 ②。
+> 抓之前记住两条，比任何技巧都重要：**从断网状态开始抓**、**故意输错一次再输对一次**。
+
 ## 怎么抓
 
 **方案 A（推荐）：电脑接在路由器 LAN 口，用 Burp 抓**
@@ -63,3 +74,5 @@ Content-Type: application/json
 1. 把 `campus-portal-auth.sh` 的 3 处填空改成正式实现（必要时加 cookie/token/心跳/加密）
 2. 你自己 `wget` 覆盖到路由器 `/etc/campus-portal-auth.sh`，`chmod +x`
 3. 跑一次 `/etc/campus-portal-auth.sh` 验证 → 再 `reboot` 验证自动登录
+
+抓包放哪、怎么让 AI 先读一遍：见 `captures/README.md` 与 `captures/AI-PROMPT.md`。

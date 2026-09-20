@@ -5,9 +5,10 @@
 | 脚本 | 干什么 | 需要抓包吗 |
 |---|---|---|
 | **`campus-net-setup.sh`**（主脚本） | 探测现状 → 问接入方式 → 配 **MAC 克隆 / TTL / MTU / UA(UA2F)** → **PPPoE 拨号** → 等 20 秒测外网、报告结果。**不实现网页认证** | 不需要，装上就能跑 |
-| **`campus-portal-auth.sh`**（认证脚本） | 网页认证：提交账号密码、判定成功、装成开机自动登录（`--install-hook`） | **需要**：标了 3 处「← 抓包」，按你学校抓包填（把抓包交给 AI 一般能直接生成） |
+| **`campus-portal-auth.sh`**（认证脚本） | 网页认证：提交账号密码、判定成功、装成开机自动登录（`--install-hook`） | **需要**：标了 3 处「← 抓包」，按你学校抓包填（抓包丢进 `captures/`，配 `captures/AI-PROMPT.md` 的提示词就能让 AI 填） |
 
-`PACKET-CAPTURE.md` 是抓包清单；有线 WAN、PPPoE、**WiFi STA 无线上联**都覆盖。
+抓包相关三件套：`PACKET-CAPTURE.md`（抓包清单）、`captures/`（抓包投放点 + AI 提示词）、`tools/burp-xml-summary.py`（把几十 MB 的 Burp XML 压成几 KB 小抄）。
+有线 WAN、PPPoE、**WiFi STA 无线上联**都覆盖。
 
 ---
 
@@ -99,7 +100,8 @@ uci commit ua3f && /etc/init.d/ua3f restart
 
 ```sh
 # 1) 抓一次登录包（含一次故意输错密码），清单见 PACKET-CAPTURE.md
-# 2) 把抓包交给 AI → 生成/补全 campus-portal-auth.sh（或自己按「← 抓包」填 3 处）
+# 2) 抓包丢进 captures/ → 用 captures/AI-PROMPT.md 的提示词让 AI 输出 6 段结论 → 我按结论补全脚本
+#    （XML 太大先压缩：python3 tools/burp-xml-summary.py captures/xx.xml -o captures/小抄.md）
 # 3) 装上去
 B=https://raw.githubusercontent.com/2476818641/Login-edu/main/openwrt
 wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/campus-portal-auth.sh
@@ -183,4 +185,6 @@ uci delete campus.main; uci commit campus
 
 ## 相关
 
+- 抓包投放点 / AI 提示词：`captures/README.md`、`captures/AI-PROMPT.md`
+- Burp XML 压缩脚本：`tools/burp-xml-summary.py`
 - 路由器固件（硬刷方案、UA2F 编译、救砖文档）：<https://github.com/2476818641/boot>

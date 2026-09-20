@@ -1,0 +1,6 @@
+# 抓包文件属于敏感数据（明文密码 / 学号 / 会话 cookie），一律不入库。
+# 只允许提交文档：README.md、AI-PROMPT.md、.gitignore
+*
+!.gitignore
+!README.md
+!AI-PROMPT.md

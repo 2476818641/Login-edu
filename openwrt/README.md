@@ -160,6 +160,15 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 >    需要认证页 JS 里的算法。**先用 `--hash-test` 对比**：能对上就用对应 `pass_mode`；对不上就把认证页 HTML 与它引用的 JS 发来。
 > 3. 认证成功后浏览器跳 `baidu.com` 是**页面 JS 自己跳的**（门户响应里没有任何 302/Location），
 >    脚本不用模拟；该窗口内也没看到周期请求，心跳保活暂按"未知"处理（cron 兜底仍在）。
+> 4. **流程已按一份"实测能上网"的手写脚本对齐**：前置多一步 `POST /api/ip.php`（空 body，
+>    该接口看起来是让服务端记录客户端 IP），默认顺序改为 `login → stat → ack_auth`
+>    （浏览器抓包是 `login → ack → stat`，两者都能过 ⇒ 后两步顺序不敏感）。
+> 5. 哈希仍未破解：已知明文 `213511` ↔ 哈希 `fc824d7f244805c56634c66e16ded895`，
+>    用 `tools/md5-probe.py` 试了 **6.7 万种**常见拼法（账号/门户/常见盐/分隔符/顺序/双重 md5/大小写）全部未命中
+>    ⇒ 盐不是常量文本，最可能是**客户端 IP**（所以才有 `/api/ip.php`）。
+>    拿到 `POST /api/ip.php` 返回的 IP 后再跑一次探针即可确认：
+>    `python3 tools/md5-probe.py --plain 213511 --hash fc824d… --user 05261241 --host 10.30.100.5 --salt <IP>`
+>    ⚠️ 若哈希确实绑定客户端 IP，那**硬编码哈希只在 IP 不变时有效**，换 IP/重拨就会失效。
 
 （本脚本已对着复刻实测流程的假门户做过端到端测试：正确密码三步成功、错密码 `ret=4` 被拒并给出
 正确提示、缺会话 cookie 被拒、哈希配错失败、`pass_md5` 应急通道、在线幂等、hook 装卸、

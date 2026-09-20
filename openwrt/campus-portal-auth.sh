@@ -58,15 +58,30 @@ HOOKDIR="${HOOKDIR:-/etc/hotplug.d/iface}"
 HOOKFILE="$HOOKDIR/99-campus-portal"
 CRONTAB_FILE="${CRONTAB_FILE:-/etc/crontabs/root}"
 SELF="${SELF:-/etc/campus-portal-auth.sh}"
+# 没有 uci 的机器（比如先在电脑上试）用这个文件存配置；--setup 会自动判断该写哪边
+CONF="${CAMPUS_CONF:-/etc/campus-portal.conf}"
+HAS_UCI=0
+command -v uci >/dev/null 2>&1 && HAS_UCI=1
+# 配置文件里全是 `: "${VAR:=值}"` 形式 —— 只在该变量还没设过时才赋值，所以环境变量仍然优先
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
 
 say() { [ "${QUIET:-0}" = 1 ] || printf '%s\n' "$*"; }
 log() { logger -t campus-portal "$*" 2>/dev/null || true; }
-ug()  { uci -q get "$1" 2>/dev/null; }
-env_or_uci() {	# env_or_uci <变量名> <uci键> <默认值>
+ug()  { [ "$HAS_UCI" = 1 ] && uci -q get "$1" 2>/dev/null; }
+env_or_uci() {	# 优先级：环境变量/配置文件 > uci > 默认值
 	eval "_v=\"\${$1:-}\""
 	[ -z "$_v" ] && _v="$(ug "$2")"
 	[ -z "$_v" ] && _v="$3"
 	eval "$1=\"\$_v\""
+}
+# 地址归一化：用户常只填 10.30.100.5（不带协议），这里补 http://
+normalize_url() {
+	case "${1:-}" in
+		'')    printf '' ;;
+		*://*) printf '%s' "$1" ;;
+		*)     printf 'http://%s' "$1" ;;
+	esac
 }
 md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 
@@ -74,28 +89,68 @@ md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 case "${1:-}" in
 --setup)
 	[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
-	printf '门户地址（浏览器打开认证页时的地址，例如 http://10.30.100.5）: '; read -r A
+	printf '门户地址（浏览器打开认证页时的地址，例如 http://10.30.100.5，也可只填 IP）: '; read -r A
 	printf '认证账号（学号/上网账号）: '; read -r U
 	printf '认证密码（明文，脚本会按哈希方式自己算）: '; read -r P
 	printf '哈希方式 [md5/plain/md5user/md5passuser/直接回车=md5]: '; read -r M
 	printf '三步认证路径 [直接回车=/api/login.php,/api/ack_auth.php,/api/stat.php]: '; read -r PATHS
 	printf '固定字段 [直接回车=authmode=0&pool=&isp_id=0&pxyacct=]: '; read -r EX
-	uci -q set campus.main='main'
-	[ -n "$A" ] && uci -q set "campus.main.auth_url=$A"
-	[ -n "$U" ] && uci -q set "campus.main.user=$U"
-	[ -n "$P" ] && uci -q set "campus.main.pass=$P"
-	[ -n "${M:-}" ] && uci -q set "campus.main.pass_mode=$M"
-	[ -n "${PATHS:-}" ] && uci -q set "campus.main.api_paths=$PATHS"
-	[ -n "${EX:-}" ] && uci -q set "campus.main.extra_fields=$EX"
-	uci -q commit campus && chmod 600 /etc/config/campus 2>/dev/null
-	echo "已保存到 uci campus（/etc/config/campus，权限 600）"
-	echo "提示：先跑一次 --hash-test，和抓包里 pass= 后面的 32 位比对，确认哈希方式对了再正式认证"
+	A_RAW="$A"
+	A="$(normalize_url "$A_RAW")"
+	case "$A_RAW" in
+		''|*://*) ;;
+		*) echo "门户地址没带协议，已按 $A 处理" ;;
+	esac
+	if [ "$HAS_UCI" = 1 ]; then
+		uci -q set campus.main='main'
+		[ -n "$A" ] && uci -q set "campus.main.auth_url=$A"
+		[ -n "$U" ] && uci -q set "campus.main.user=$U"
+		[ -n "$P" ] && uci -q set "campus.main.pass=$P"
+		[ -n "${M:-}" ] && uci -q set "campus.main.pass_mode=$M"
+		[ -n "${PATHS:-}" ] && uci -q set "campus.main.api_paths=$PATHS"
+		[ -n "${EX:-}" ] && uci -q set "campus.main.extra_fields=$EX"
+		# 关键：commit 之后**读回来核对**，不能像以前那样不管成败都打印"已保存"
+		if ! uci -q commit campus; then
+			echo "❌ uci commit campus 失败（配置没保存）" >&2
+			exit 1
+		fi
+		chmod 600 /etc/config/campus 2>/dev/null
+		BACK="$(uci -q get campus.main.pass)"
+		if [ "$BACK" != "$P" ]; then
+			echo "❌ 写进去又读回来对不上（读到：${BACK:-空}）——配置没生效，别继续" >&2
+			exit 1
+		fi
+		echo "已保存到 uci campus（/etc/config/campus，权限 600），门户地址=$A，账号=$U"
+	else
+		# 没有 uci：写一个可 source 的配置文件（电脑上先用它验证，注意不是路由器）
+		{
+			printf '# 由 campus-portal-auth.sh --setup 生成（本机没有 uci）\n'
+			printf '# 只在该变量还没设过时才赋值，所以命令行上的环境变量仍然优先\n'
+			[ -n "$A" ] && printf ': "${PORTAL:=%s}"\n' "$A"
+			[ -n "$U" ] && printf ': "${CAMPUS_USER:=%s}"\n' "$U"
+			[ -n "$P" ] && printf ': "${CAMPUS_PASS:=%s}"\n' "$P"
+			printf ': "${PASS_MODE:=%s}"\n' "${M:-md5}"
+			[ -n "${PATHS:-}" ] && printf ': "${API_PATHS:=%s}"\n' "$PATHS"
+			[ -n "${EX:-}" ] && printf ': "${EXTRA_FIELDS:=%s}"\n' "$EX"
+			:	# 保证整块以成功状态结束（上面的 && 短路会返回 1）
+		} > "$CONF" || { echo "❌ 写 $CONF 失败" >&2; exit 1; }
+		chmod 600 "$CONF"
+		echo "⚠️  本机没有 uci（不是路由器？），已改存到 $CONF（权限 600）"
+		echo "    在这台机器上跑认证/测试没问题；要装成开机自动认证请把脚本搬到路由器上再 --setup"
+	fi
+	echo "提示：下一步跑 --force 真连一次门户看结果；--hash-test 只用于和**同账号**的抓包比对"
 	exit 0
 	;;
 --hash-test)
 	env_or_uci CAMPUS_USER campus.main.user ''
 	env_or_uci CAMPUS_PASS campus.main.pass ''
-	[ -n "$CAMPUS_PASS" ] || { echo "还没配密码：先跑 $SELF --setup"; exit 2; }
+	if [ -z "$CAMPUS_PASS" ]; then
+		echo "还没配密码。两种情况："
+		echo "  · 在路由器上：$SELF --setup（写进 uci）"
+		echo "  · 在电脑上（没有 uci）：直接给环境变量，例如"
+		echo "      CAMPUS_USER=05261241 CAMPUS_PASS=你的明文密码 sh $SELF --hash-test"
+		exit 2
+	fi
 	echo "账号: ${CAMPUS_USER:-（未配）}"
 	echo "把下面每一行右边那串，和抓包 POST body 里 pass= 后面的值对比，一样的就是正确方式："
 	printf '  md5(明文)             %s\n'   "$(md5hex "$CAMPUS_PASS")"
@@ -110,6 +165,11 @@ case "${1:-}" in
 	;;
 --install-hook)
 	[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
+	if [ "$HAS_UCI" != 1 ] && [ "${FORCE_HOOK:-0}" != 1 ]; then
+		echo "⚠️  本机没有 uci（不是路由器）：--install-hook 是给路由器装 hotplug + cron 的" >&2
+		echo "    真要在本机装：FORCE_HOOK=1 $SELF --install-hook" >&2
+		exit 2
+	fi
 	[ -x "$SELF" ] || { echo "先把自己放到 $SELF 并 chmod +x：wget -O $SELF <raw> && chmod +x $SELF"; exit 1; }
 	mkdir -p "$HOOKDIR"
 	cat > "$HOOKFILE" <<-EOF
@@ -201,10 +261,13 @@ fi
 
 [ -n "$PORTAL" ] || { say "没配门户地址：跑 $SELF --setup，或 uci set campus.main.auth_url=http://门户地址"; exit 2; }
 [ -n "$CAMPUS_USER" ] || { say "没配账号：跑 $SELF --setup，或 uci set campus.main.user=..."; exit 2; }
-case "$PORTAL" in
-	*'/'|*'/api/'*) : ;;	# 允许带尾斜杠；下面统一去掉
-esac
+# 归一化：补协议（uci/配置里可能只存了 10.30.100.5）+ 去掉尾斜杠
+PORTAL="$(normalize_url "$PORTAL")"
 PORTAL="${PORTAL%/}"
+case "$PORTAL" in
+	http://*|https://*) ;;
+	*) say "门户地址看着不对：$PORTAL（应为 http(s)://主机[:端口]）"; exit 2 ;;
+esac
 
 # 用函数而不是拼字符串：UA 里有空格，拼字符串会被 shell 拆成多个参数
 curl_auth() {

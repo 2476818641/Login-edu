@@ -216,41 +216,145 @@ if [ "$MTU" != "keep" ] && [ -n "$MTU" ]; then
 	msg "    MTU → $MTU"
 fi
 
-# --- 2.3 TTL：除了本地网桥，其它出口一律改写
-if [ "$DRY_RUN" = 1 ]; then
-	printf '    [dry-run] 写 %s：\n' "$TTL_FILE"
-	printf '              chain ttl_fix { ... oifname != { %s } ip ttl set %s ... }\n' "$LAN_DEVS" "$TTL_VALUE"
-else
-	mkdir -p "$(dirname "$TTL_FILE")"
-	[ -f "$TTL_FILE" ] && cp -f "$TTL_FILE" "$TTL_FILE.bak"
-	cat > "$TTL_FILE" <<-EOF
-	# campus-net-setup.sh 生成：校园网防 TTL 检测
-	# fw4 会把 /etc/nftables.d/*.nft 包含进 table inet fw4，这里定义一条自己的 postrouting 链
-	# （priority mangle + 1，比 fw4 自带的 mangle_postrouting 晚一步执行）。
-	# 语义：除本地网桥（LAN）以外的所有出口，IPv4 TTL 与 IPv6 hop limit 都改成 $TTL_VALUE。
-	# 要改设备/关掉：改或删掉本文件后执行 fw4 reload
-	chain ttl_fix {
-	    type filter hook postrouting priority mangle + 1; policy accept;
-	    oifname != { $LAN_DEVS } ip ttl set $TTL_VALUE
-	    oifname != { $LAN_DEVS } ip6 hoplimit set $TTL_VALUE
-	}
-	EOF
-	msg "    TTL → 固定 $TTL_VALUE（排除 $LAN_DEVS，其余出口全改）"
+# --- 先确定用哪个 UA 方案（UA3F 优先）
+#     UA3F 是 UA2F 的超集：UA 改写 + L3 重写（TTL / IPID / 删 TCP 时间戳 / TCP 初始窗口 / 阻断 QUIC）
+#     + Desync（分片乱序 / 混淆注入）+ 可选 HTTPS MitM —— 有 UA3F 就让 UA3F 干，不重复造轮子
+UA_IMPL=""
+[ -x /usr/bin/ua3f ] && UA_IMPL="ua3f"
+[ -z "$UA_IMPL" ] && { [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; } && UA_IMPL="ua2f"
+[ -z "$UA_IMPL" ] && [ -n "$(uget ua3f.enabled.enabled)" ] && UA_IMPL="ua3f"
+TTL_BY_NFT=1
+
+# --- 2.3 TTL
+if [ "$UA_IMPL" = "ua3f" ]; then
+	msg "    检测到 UA3F：TTL / IPID / TCP 这些 L3 特征交给它做"
+	ask "    要不要【另外】再加一条内核 nft 兜底（全流量含 ICMP/UDP，零开销）(y/N)" "y"
+	case "$REPLY" in
+	1|y|Y|yes|是) TTL_BY_NFT=1 ;;
+	*)
+		TTL_BY_NFT=0
+		msg "    不加兜底：TTL 交给 UA3F（之前装过的规则文件会删掉）"
+		run rm -f "$TTL_FILE" ;;
+	esac
 fi
 
-# --- 2.4 UA（UA2F）
-UA2F_ENABLED=""
-if [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; then
+if [ "$TTL_BY_NFT" = 1 ]; then
+	if [ "$DRY_RUN" = 1 ]; then
+		printf '    [dry-run] 写 %s：\n' "$TTL_FILE"
+		printf '              chain ttl_fix { ... oifname != { %s } ip ttl set %s ... }\n' "$LAN_DEVS" "$TTL_VALUE"
+	else
+		mkdir -p "$(dirname "$TTL_FILE")"
+		[ -f "$TTL_FILE" ] && cp -f "$TTL_FILE" "$TTL_FILE.bak"
+		cat > "$TTL_FILE" <<-EOF
+		# campus-net-setup.sh 生成：校园网防 TTL 检测（内核兜底，UA3F 的 TTL 重写并不冲突）
+		# fw4 会把 /etc/nftables.d/*.nft 包含进 table inet fw4，这里定义一条自己的 postrouting 链
+		# （priority mangle + 1，比 fw4 自带的 mangle_postrouting 晚一步执行）。
+		# 语义：除本地网桥（LAN）以外的所有出口，IPv4 TTL 与 IPv6 hop limit 都改成 $TTL_VALUE。
+		# 要改设备/关掉：改或删掉本文件后执行 fw4 reload
+		chain ttl_fix {
+		    type filter hook postrouting priority mangle + 1; policy accept;
+		    oifname != { $LAN_DEVS } ip ttl set $TTL_VALUE
+		    oifname != { $LAN_DEVS } ip6 hoplimit set $TTL_VALUE
+		}
+		EOF
+		msg "    TTL → 固定 $TTL_VALUE（排除 $LAN_DEVS，其余出口全改；内核兜底）"
+	fi
+fi
+
+# --- 2.4 UA（UA3F 优先；老固件的 UA2F 自动兼容）
+case "$UA_IMPL" in
+ua3f)
+	CUR_EN="$(uget ua3f.enabled.enabled)"; [ -z "$CUR_EN" ] && CUR_EN=1
+	CUR_MODE="$(uget ua3f.main.server_mode)"; [ -z "$CUR_MODE" ] && CUR_MODE=TPROXY
+	CUR_UA="$(uget ua3f.main.ua)"; [ -z "$CUR_UA" ] && CUR_UA=FFF
+	CUR_TTL="$(uget ua3f.main.l3_rewrite_ttl)"; [ -z "$CUR_TTL" ] && CUR_TTL=0
+	msg "    UA3F 现状：启用=$CUR_EN 服务模式=$CUR_MODE UA=$CUR_UA TTL重写=$CUR_TTL"
+	[ -z "$(uget ua3f.main.header_rewrite)" ] && \
+		warn "      规则表(header_rewrite)是空的 → 装了也不会改 UA，去 LuCI「服务→UA3F」恢复默认规则"
+
+	ask "    启用 UA3F（UA 改写 + L3 重写，校园网防检测核心）" "$CUR_EN"
+	case "$REPLY" in
+	1|y|Y|yes|是)
+		UA_ENABLED=1
+		msg "    服务模式：NFQUEUE=老 UA2F 那套（开销最低，推荐）/ TPROXY=代理模式（功能全但吃 CPU）"
+		ask "    服务模式" "$CUR_MODE"
+		case "$REPLY" in
+		NFQUEUE|nfqueue) run uci set ua3f.main.server_mode='NFQUEUE' ;;
+		TPROXY|tproxy)   run uci set ua3f.main.server_mode='TPROXY' ;;
+		*)               run uci set "ua3f.main.server_mode=$REPLY" ;;
+		esac
+		msg "    UA 串可填：keep=不改 / win=常见 Chrome UA / 任意字符串（默认 FFF）"
+		ask "    UA 串" "$CUR_UA"
+		case "$REPLY" in
+		keep|KEEP) ;;
+		win|WIN|chrome)
+			run uci set 'ua3f.main.ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' ;;
+		*) run uci set "ua3f.main.ua=$REPLY" ;;
+		esac
+
+		# ↓ 这些都是 UA3F 独有（UA2F 完全没有）的能力，按学校检测项按需开
+		ask "    打开 TTL 重写（l3_rewrite_ttl，出口 TTL 统一成本机值）(y/N)" "$CUR_TTL"
+		case "$REPLY" in
+		1|y|Y|yes|是)
+			run uci set ua3f.main.l3_rewrite_ttl='1'
+			ask "      TTL 目标值" "$(uget ua3f.main.l3_rewrite_ttl_value)"; [ -z "$REPLY" ] && REPLY=64
+			run uci set "ua3f.main.l3_rewrite_ttl_value=$REPLY" ;;
+		*) run uci set ua3f.main.l3_rewrite_ttl='0' ;;
+		esac
+		ask "    打开 IPID 重写（l3_rewrite_ipid，校园网查 IPID 时有用）(y/N)" "$(uget ua3f.main.l3_rewrite_ipid)"
+		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_ipid='1' ;; *) run uci set ua3f.main.l3_rewrite_ipid='0' ;; esac
+		ask "    删除 TCP Timestamp（l3_rewrite_tcpts）(y/N)" "$(uget ua3f.main.l3_rewrite_tcpts)"
+		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_tcpts='1' ;; *) run uci set ua3f.main.l3_rewrite_tcpts='0' ;; esac
+		ask "    修改 TCP 初始窗口（l3_rewrite_tcpwin，先别开）(y/N)" "$(uget ua3f.main.l3_rewrite_tcpwin)"
+		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_tcpwin='1' ;; *) run uci set ua3f.main.l3_rewrite_tcpwin='0' ;; esac
+		ask "    阻断 QUIC（l3_rewrite_block_quic，强制回落 TCP 好让改写生效）(y/N)" "$(uget ua3f.main.l3_rewrite_block_quic)"
+		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_block_quic='1' ;; *) run uci set ua3f.main.l3_rewrite_block_quic='0' ;; esac
+		ask "    L3 重写用 eBPF 加速（l3_rewrite_bpf_offload；内核 ≥5.15，省 CPU）(y/N)" "$(uget ua3f.main.l3_rewrite_bpf_offload)"
+		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_bpf_offload='1' ;; *) run uci set ua3f.main.l3_rewrite_bpf_offload='0' ;; esac
+
+		msg "    下面两项是 Desync（对付深层包检测 DPI 的乱序/混淆），不确定就都选 N"
+		ask "    TCP 分片乱序发射（desync_reorder）(y/N)" "$(uget ua3f.main.desync_reorder)"
+		case "$REPLY" in
+		1|y|Y|yes|是)
+			run uci set ua3f.main.desync_reorder='1'
+			ask "      乱序分片字节数" "$(uget ua3f.main.desync_reorder_bytes)"; [ -z "$REPLY" ] && REPLY=1500
+			run uci set "ua3f.main.desync_reorder_bytes=$REPLY"
+			ask "      乱序包大小" "$(uget ua3f.main.desync_reorder_packets)"; [ -z "$REPLY" ] && REPLY=8
+			run uci set "ua3f.main.desync_reorder_packets=$REPLY" ;;
+		*) run uci set ua3f.main.desync_reorder='0' ;;
+		esac
+		ask "    TCP 混淆注入（desync_inject）(y/N)" "$(uget ua3f.main.desync_inject)"
+		case "$REPLY" in
+		1|y|Y|yes|是)
+			run uci set ua3f.main.desync_inject='1'
+			ask "      注入包 TTL" "$(uget ua3f.main.desync_inject_ttl)"; [ -z "$REPLY" ] && REPLY=3
+			run uci set "ua3f.main.desync_inject_ttl=$REPLY" ;;
+		*) run uci set ua3f.main.desync_inject='0' ;;
+		esac
+		ask "    日志等级（WARN=安静 / INFO=排查用）" "$(uget ua3f.main.log_level)"; [ -z "$REPLY" ] && REPLY=WARN
+		run uci set "ua3f.main.log_level=$REPLY"
+		msg "    HTTPS MitM 没动（只给指定域名解密才需要，要先配 CA；在 LuCI「服务→UA3F」里做）"
+		run uci set ua3f.enabled.enabled='1'
+		;;
+	*)
+		UA_ENABLED=0
+		run uci set ua3f.enabled.enabled='0'
+		msg "    UA3F → 关闭"
+		;;
+	esac
+	;;
+ua2f)
 	CUR_EN="$(uget ua2f.enabled.enabled)"; [ -z "$CUR_EN" ] && CUR_EN=1
 	CUR_UA="$(uget ua2f.main.custom_ua)"
 	CUR_TLS="$(uget ua2f.firewall.handle_tls)"; [ -z "$CUR_TLS" ] && CUR_TLS=0
 	CUR_INTRA="$(uget ua2f.firewall.handle_intranet)"; [ -z "$CUR_INTRA" ] && CUR_INTRA=1
-	msg "    UA2F 现状：启用=${CUR_EN} 自定义UA=${CUR_UA:-（空=用内置默认）} 处理443=$CUR_TLS 处理内网=$CUR_INTRA"
+	msg "    UA2F 现状：启用=$CUR_EN 自定义UA=${CUR_UA:-（空=用内置默认）} 处理443=$CUR_TLS 处理内网=$CUR_INTRA"
+	msg "    提示：UA2F 只改 UA；要 TTL/IPID/TCP 那套 L3 对抗，建议固件换成 UA3F"
 
-	ask "    启用 UA2F（改写 User-Agent，校园网防检测核心）" "$CUR_EN"
+	ask "    启用 UA2F（改写 User-Agent）" "$CUR_EN"
 	case "$REPLY" in
 	1|y|Y|yes|是)
-		UA2F_ENABLED=1
+		UA_ENABLED=1
 		msg "    自定义 UA 可填：keep=不改 / empty=清空用内置默认 / win=常见 Chrome UA / 或直接粘贴整串"
 		ask "    自定义 UA" "${CUR_UA:-keep}"
 		case "$REPLY" in
@@ -260,23 +364,25 @@ if [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; then
 			run uci set ua2f.main.custom_ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' ;;
 		*) run uci set "ua2f.main.custom_ua=$REPLY" ;;
 		esac
-		ask "    也处理 443 端口的明文 HTTP（handle_tls，校园网常在 443 上做检测）" "$CUR_TLS"
+		ask "    也处理 443 端口的明文 HTTP（handle_tls）" "$CUR_TLS"
 		case "$REPLY" in 1|y|Y|yes|是) run uci set ua2f.firewall.handle_tls='1' ;; *) run uci set ua2f.firewall.handle_tls='0' ;; esac
 		ask "    也处理内网地址流量（handle_intranet；认证页在内网又登不上时改 0）" "$CUR_INTRA"
 		case "$REPLY" in 1|y|Y|yes|是) run uci set ua2f.firewall.handle_intranet='1' ;; *) run uci set ua2f.firewall.handle_intranet='0' ;; esac
-		run uci set ua2f.firewall.handle_fw='1'		# 必须开，否则 ua2f 不建规则链
+		run uci set ua2f.firewall.handle_fw='1'
 		run uci set ua2f.enabled.enabled='1'
 		;;
 	*)
-		UA2F_ENABLED=0
+		UA_ENABLED=0
 		run uci set ua2f.enabled.enabled='0'
 		msg "    UA2F → 关闭"
 		;;
 	esac
-else
-	warn "没装 ua2f（/usr/bin/ua2f 不存在）—— 跳过 UA 部分"
-	msg "    想装：apk add ua2f luci-app-ua2f（自编译固件建议直接加进 .config 重编）"
-fi
+	;;
+*)
+	warn "没装 UA3F / UA2F（/usr/bin/ua3f 不存在）—— 跳过 UA 部分"
+	msg "    想要：把 UA3F 编进固件，或在有依赖的固件上装官方 apk（见 README「附：不想重编固件」）"
+	;;
+esac
 
 # ---------------------------------------------------------------- 3) 应用
 info "3/4 应用配置"
@@ -292,12 +398,12 @@ else
 	run uci set "network.$WANIF.proto=dhcp"
 fi
 run uci commit network
-if [ -n "${UA2F_ENABLED:-}" ]; then run uci commit ua2f; fi
+if [ -n "${UA_IMPL:-}" ]; then run uci commit "$UA_IMPL"; fi
 
 if [ "$DRY_RUN" = 1 ]; then
 	printf '    [dry-run] /etc/init.d/network %s\n' "$([ "$OLD_PROTO" != "$NEW_PROTO" ] && echo restart || echo reload)"
 	printf '    [dry-run] fw4 reload\n'
-	[ -n "${UA2F_ENABLED:-}" ] && printf '    [dry-run] /etc/init.d/ua2f %s\n' "$([ "$UA2F_ENABLED" = 1 ] && echo restart || echo stop)"
+	[ -n "${UA_IMPL:-}" ] && printf '    [dry-run] /etc/init.d/%s %s\n' "$UA_IMPL" "$([ "${UA_ENABLED:-0}" = 1 ] && echo restart || echo stop)"
 else
 	if [ "$OLD_PROTO" != "$NEW_PROTO" ]; then
 		msg "    proto 变了（${OLD_PROTO:-空} → $NEW_PROTO），用 restart"
@@ -307,16 +413,16 @@ else
 	fi
 	sleep 2
 	command -v fw4 >/dev/null 2>&1 && run fw4 reload
-	if [ -n "${UA2F_ENABLED:-}" ]; then
-		if [ "$UA2F_ENABLED" = 1 ]; then
-			run /etc/init.d/ua2f restart
+	if [ -n "${UA_IMPL:-}" ]; then
+		if [ "${UA_ENABLED:-0}" = 1 ]; then
+			run /etc/init.d/"$UA_IMPL" restart
 			sleep 1
-			if pgrep -f '[u]a2f' >/dev/null 2>&1; then msg "    ua2f 进程：在跑 ✅"; else warn "    ua2f 没跑起来，看 logread | grep ua2f"; fi
+			if pgrep -f "$UA_IMPL" >/dev/null 2>&1; then msg "    $UA_IMPL 进程：在跑 ✅"; else warn "    $UA_IMPL 没跑起来，看 logread | grep $UA_IMPL"; fi
 		else
-			run /etc/init.d/ua2f stop
+			run /etc/init.d/"$UA_IMPL" stop
 		fi
 	fi
-	log "applied: iface=$WANIF mode=$CAMPUS_MODE mac=${CLONE_MAC:-unchanged} mtu=${MTU:-unchanged} ttl=$TTL_VALUE ua2f=${UA2F_ENABLED:-none}"
+	log "applied: iface=$WANIF mode=$CAMPUS_MODE mac=${CLONE_MAC:-unchanged} mtu=${MTU:-unchanged} ttl=${TTL_BY_NFT:-0}/nft ua=${UA_IMPL:-none}:${UA_ENABLED:-none}"
 fi
 
 # ---------------------------------------------------------------- 4) 等 20 秒 → 测
@@ -333,7 +439,7 @@ check_net() {
 if check_net; then
 	info "外网已通 ✅"
 	msg "    出口 IP : $(curl -s -m 8 http://ip.3322.net 2>/dev/null || echo 取不到)"
-	[ "${UA2F_ENABLED:-0}" = 1 ] && msg "    验 UA   : 浏览器打开 http://ua-check.stagoh.com/ 看 User-Agent 是否已统一"
+	[ "${UA_ENABLED:-0}" = 1 ] && msg "    验 UA   : 浏览器打开 http://ua-check.stagoh.com/ 看 User-Agent（UA3F 默认会把该站显示成 UA3F）"
 	if [ "${AUTH_REQUIRED:-1}" = 1 ]; then
 		msg "    提示     : 还没跑过网页认证，但外网已通（学校可能直接放行，或已认证过）"
 		msg "               要让它在掉线后自动补认证：campus-portal-auth.sh --install-hook"
@@ -369,8 +475,11 @@ fi
 
 info "完成"
 cat <<EOF
-    以后要改：LuCI → 网络 → 接口 → 设备（MAC/MTU）／ 网络 → UA2F（UA 相关）
-    TTL 规则：$TTL_FILE（改完 fw4 reload；关掉就删掉它再 fw4 reload）
+    以后要改：LuCI → 网络 → 接口 → 设备（MAC/MTU）／ 服务 → UA3F（UA、L3 重写、Desync）
+    防识别分工：
+      UA 改写 / TTL / IPID / TCP 时间戳 / TCP 初始窗口 / QUIC 阻断 / Desync → UA3F（服务 → UA3F）
+      MAC 克隆、MTU                                                        → netifd（网络 → 接口 → 设备）
+      TTL 内核兜底（可选、全流量）$([ "${TTL_BY_NFT:-0}" = 1 ] && echo "→ $TTL_FILE（改完 fw4 reload；关掉就删掉它再 fw4 reload）" || echo "→ 本次没装（TTL 交给 UA3F）")
     接入方式：uci set network.$WANIF.proto=... 之后 /etc/init.d/network restart
     无线 STA 还没建好？最小配置（SSID/密码换成你的）：
       uci set wireless.sta=wifi-iface

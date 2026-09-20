@@ -32,7 +32,7 @@ sh /tmp/campus-net-setup.sh                # 正式跑
 | 选 `3` 之后的认证方式 | **WiFi 上联一样要认证**：`1` 网页认证（默认）／`2` PPPoE／`3` 不用认证（家里测试） |
 | 要克隆的 MAC | 回车=不改；`auto`=取 `/tmp/dhcp.leases` 第一台设备；或填 `AA:BB:CC:DD:EE:FF` |
 | MTU | PPPoE 默认 1492，网页认证 1500，无线上联默认 `keep`（由 AP 决定） |
-| UA2F / 自定义 UA / 443 / 内网 | 自定义 UA 支持 `keep`、`empty`、`win`（常见 Chrome UA）或直接粘贴整串 |
+| UA（UA3F，自动识别） | 自动判断固件里装的是 **UA3F**（新，推荐，带 L3 重写）还是 **UA2F**（老固件）。UA3F 会问：启用 / **服务模式**（`NFQUEUE` 最省，`TPROXY` 功能全）/ **UA 串**（`keep`、`win`=常见 Chrome UA、或直接粘贴）/ **L3 重写**：TTL(=64)、IPID、删 TCP Timestamp、TCP 初始窗口、阻断 QUIC |
 
 它改了什么（都可回滚）：
 
@@ -42,7 +42,7 @@ sh /tmp/campus-net-setup.sh                # 正式跑
 | MTU / MRU | `network.<iface>.mtu` / `.mru` | `uci delete ...` |
 | 接入方式 | `network.<iface>.proto`（pppoe + 账号密码 / dhcp） | 改回 `dhcp` |
 | **TTL** | `/etc/nftables.d/10-ttl-fix.nft`（**除 LAN 网桥外所有出口**改回 64） | `rm` 该文件 + `fw4 reload` |
-| UA | `ua2f.*`（`handle_fw` 强制开，否则 ua2f 不建规则链） | LuCI「网络→UA2F」 |
+| UA | `ua3f.*`（启用/服务模式/UA 串/L3 重写开关）；老固件才是 `ua2f.*` | LuCI「服务→UA3F」（老固件「网络→UA2F」） |
 
 > `/etc/nftables.d/` 在 firewall4 的 keep.d 里，**刷固件升级后 TTL 规则仍在**。
 > 规则用"排除 LAN 网桥"而不是写死设备名，所以网线 / PPPoE / 无线 STA 都自动覆盖。
@@ -52,6 +52,48 @@ sh /tmp/campus-net-setup.sh                # 正式跑
 - **通了** → 收工（网页认证模式下若直接通，说明学校放行或已认证过）
 - **没通 + PPPoE** → 提示去看 `logread` 里的 pppd 报错
 - **没通 + 网页认证（有线上联和无线都一样）** → 探出认证页地址，并让你去做第 2 步
+
+### 功能对应表：校园网的每一种检测，由谁来实现
+
+UA3F 优先 —— 它有 UA2F 完全没有的 L3 重写与 Desync，脚本会**自动检测并优先用 UA3F**：
+
+| 校园网检测项 | 谁来做 | 具体选项 / 位置 |
+|---|---|---|
+| **User-Agent**（判断是不是路由器共享） | **UA3F** | `ua3f.main.ua`（替换串）+ `ua3f.main.header_rewrite`（规则表，LuCI「服务→UA3F」里可视化编辑；默认对微信/B站/Steam 放行） |
+| **TTL**（共享的包过一跳 -1） | **UA3F** | `ua3f.main.l3_rewrite_ttl=1` + `l3_rewrite_ttl_value=64`；另可选内核 nft 兜底（全流量含 ICMP/UDP，脚本会问） |
+| **IPID**（部分 Dr.COM 会查） | **UA3F** | `ua3f.main.l3_rewrite_ipid=1` |
+| **TCP Timestamp**（指纹特征） | **UA3F** | `ua3f.main.l3_rewrite_tcpts=1`（删掉该选项） |
+| **TCP 初始窗口**（指纹特征） | **UA3F** | `ua3f.main.l3_rewrite_tcpwin=1` |
+| **QUIC 绕过**（走 UDP 443 躲开改写） | **UA3F** | `ua3f.main.l3_rewrite_block_quic=1`（强制回落 TCP） |
+| **深层包检测 DPI** | **UA3F** | `desync_reorder`（分片乱序，+`_bytes`/`_packets`）、`desync_inject`（混淆注入，+`_ttl`） |
+| **HTTPS 里的 UA**（需要解密才能改） | **UA3F** | HTTPS MitM：`mitm_enabled` + CA（客户端要信任该 CA，仅对指定域名生效） |
+| 改写性能（省 CPU） | **UA3F** | `l3_rewrite_bpf_offload=1`（eBPF，要求内核 ≥5.15） |
+| **MAC 绑定** | netifd（脚本配置） | `config device` → `macaddr`；无线上联写在 `wireless` 的 `wifi-iface` |
+| **MTU** | netifd（脚本配置） | `network.<iface>.mtu` / `.mru` |
+| **网页认证（portal）** | `campus-portal-auth.sh` | POST 账号密码到认证接口（按抓包生成） |
+| **PPPoE 拨号** | netifd（脚本配置） | `network.<iface>.proto=pppoe` + 账号密码 |
+
+服务模式选择：`NFQUEUE`（老 UA2F 那条路，内核队列，开销最低）或 `TPROXY`（完整代理，功能全但吃 CPU）。
+不确定就先用 `NFQUEUE`。
+
+### 附：不想重编固件？先手动装 UA3F 也能用
+
+UA3F 官方发布页提供了各架构的 `apk` / `ipk`（我们的目标 `aarch64_cortex-a53` 就有）。**依赖满足时**直接装即可：
+
+```sh
+# 依赖（本仓库固件全部自带；换别的固件请先确认这些都在）
+#   iptables-nft / iptables-mod-{tproxy,extra,ipopt,nfqueue,conntrack-extra}
+#   ipset / luci-compat / kmod-nf-conntrack-netlink
+apk add /tmp/ua3f-3.6.0-r1-aarch64_cortex-a53.apk     # 老固件用 opkg install ua3f_*.ipk
+uci set ua3f.enabled.enabled=1
+uci set ua3f.main.server_mode=NFQUEUE     # 先走省 CPU 的那条路
+uci commit ua3f && /etc/init.d/ua3f restart
+```
+
+两条注意：
+
+- **这样装出来的 UA3F 在 overlay 里，sysupgrade 升级固件后会丢**，升级完要重装（编进固件的版本没这个问题）。
+- 依赖里的 `kmod-nf-conntrack-netlink` 是**内核模块**：自编译固件如果没选它，官方仓库的 kmod 装不上（vermagic 不匹配），这时只能重编固件把它带进去。
 
 ### 第 2 步：网页认证脚本（需要抓包）
 
@@ -127,7 +169,8 @@ uci commit wireless; uci commit network; wifi reload; /etc/init.d/network restar
 | 主脚本跑完不通（网页认证） | 正常，认证不在主脚本里做 —— 去做第 2 步（抓包生成认证脚本） |
 | 认证脚本跑了但还不通 | ① 字段名/成功标志与抓包不一致 ② 需要先 GET 拿 cookie/token ③ 认证页在内网、被 UA2F 改了 UA → `uci set ua2f.firewall.handle_intranet=0; uci commit ua2f; /etc/init.d/ua2f restart` ④ 账号已在别处登录 |
 | TTL 改了还被检测 | `nft list chain inet fw4 ttl_fix` 看规则在不在；若你的 WAN 也是网桥，把它从规则排除列表里去掉 |
-| UA2F 开着但 UA 没变 | 检查 `ua2f.firewall.handle_fw=1`；浏览器打开 <http://ua-check.stagoh.com/> 验证 |
+| UA3F 开着但 UA 没变 | ① `uci get ua3f.enabled.enabled` 要为 1 ② `ua3f.main.header_rewrite` 规则表别是空的（空的就不会改）③ 默认规则对微信/B站/Steam 是放行的。浏览器打开 <http://ua-check.stagoh.com/> 验证（该站默认会显示 `UA3F`）|
+| UA2F 与 UA3F | UA2F 只做 UA 改写（NFQUEUE）；UA3F 是它的超集（多 L3 重写 + Desync + 可选 MitM）。**别同时开**，脚本会自动优先识别 UA3F |
 | 想改回原样 | 删 `/etc/nftables.d/10-ttl-fix.nft` + `fw4 reload`；LuCI 里把 MAC/MTU 去掉；`/etc/campus-portal-auth.sh --uninstall-hook` |
 
 ## 卸载

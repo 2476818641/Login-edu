@@ -34,8 +34,8 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 
 | 检测手段 | 路由器上怎么对付 | 本仓库对应脚本 |
 |---|---|---|
-| **User-Agent**（Dr.COM 等查 UA 判断是不是路由器共享） | UA2F 统一改写 UA | `campus-net-setup.sh` 第 2 步的 UA 段 |
-| **TTL**（共享的包经过一跳 TTL 会 -1） | nftables 在 postrouting 把出口 TTL 改回 64 | 同上，写入 `/etc/nftables.d/10-ttl-fix.nft` |
+| **User-Agent**（Dr.COM 等查 UA 判断是不是路由器共享） | **UA3F** 统一改写 UA（老固件上的 UA2F 也兼容） | `campus-net-setup.sh` 第 2 步的 UA 段 |
+| **TTL / IPID / TCP 指纹** | ① UA3F 的 L3 重写（TTL/IPID/TCP 时间戳/初始窗口）② 脚本另写一条内核 nft 规则兜底（全流量、零开销） | 同上；nft 规则写入 `/etc/nftables.d/10-ttl-fix.nft` |
 | **MAC 绑定** | 把电脑的 MAC 克隆到 WAN 侧 | 同上（有线上联写 network，无线上联写 wireless） |
 | **网页认证（portal）** | 定时 POST 账号密码到认证接口（**有线、WiFi 上联都一样要**） | `campus-portal-auth.sh`（+ `--install-hook` 自动登录） |
 | **PPPoE 拨号** | netifd 里配 pppoe | `campus-net-setup.sh` 方式 1 |

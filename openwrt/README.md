@@ -5,7 +5,7 @@
 | 脚本 | 干什么 | 需要抓包吗 |
 |---|---|---|
 | **`campus-net-setup.sh`**（主脚本） | 探测现状 → 问接入方式 → 配 **MAC 克隆 / TTL / MTU / UA(UA2F)** → **PPPoE 拨号** → 等 20 秒测外网、报告结果。**不实现网页认证** | 不需要，装上就能跑 |
-| **`campus-portal-auth.sh`**（认证脚本） | 网页认证：提交账号密码、判定成功、装成开机自动登录（`--install-hook`） | **需要**：标了 3 处「← 抓包」，按你学校抓包填（抓包丢进 `captures/`，配 `captures/AI-PROMPT.md` 的提示词就能让 AI 填） |
+| **`campus-portal-auth.sh`**（认证脚本） | 网页认证：提交账号密码、判定成功、装成开机自动登录（`--install-hook`） | **已按一次实测抓包实现**（三步 API + MD5 密码，全部可配）：换个学校通常只改 uci，无需改脚本；想让它适配你的门户，抓包丢进 `captures/`，配 `captures/AI-PROMPT.md` 的提示词让 AI 出结论 |
 
 抓包相关三件套：`PACKET-CAPTURE.md`（抓包清单）、`captures/`（抓包投放点 + AI 提示词）、`tools/burp-xml-summary.py`（把几十 MB 的 Burp XML 压成几 KB 小抄）。
 有线 WAN、PPPoE、**WiFi STA 无线上联**都覆盖。
@@ -96,25 +96,43 @@ uci commit ua3f && /etc/init.d/ua3f restart
 - **这样装出来的 UA3F 在 overlay 里，sysupgrade 升级固件后会丢**，升级完要重装（编进固件的版本没这个问题）。
 - 依赖里的 `kmod-nf-conntrack-netlink` 是**内核模块**：自编译固件如果没选它，官方仓库的 kmod 装不上（vermagic 不匹配），这时只能重编固件把它带进去。
 
-### 第 2 步：网页认证脚本（需要抓包）
+### 第 2 步：网页认证脚本（已按实测抓包实现，只需填账号）
+
+脚本的 3 处填空**已经按一次真实抓包填好了**：门户 `http://10.30.100.5` 的三步 API ——
+`GET /` 拿会话 cookie（`RAASSESSID`）→ `POST /api/login.php` → `POST /api/ack_auth.php` → `POST /api/stat.php`，
+密码 **MD5 后**提交，三次 body 都是 `user=&pass=&authmode=0&pool=&isp_id=0&pxyacct=`。
+路径、字段名、固定字段、哈希方式全部可配，**换学校不用改脚本，只改 uci**。
 
 ```sh
-# 1) 抓一次登录包（含一次故意输错密码），清单见 PACKET-CAPTURE.md
-# 2) 抓包丢进 captures/ → 用 captures/AI-PROMPT.md 的提示词让 AI 输出 6 段结论 → 我按结论补全脚本
-#    （XML 太大先压缩：python3 tools/burp-xml-summary.py captures/xx.xml -o captures/小抄.md）
-# 3) 装上去
+# 1) 装上去
 B=https://raw.githubusercontent.com/2476818641/Login-edu/main/openwrt
 wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/campus-portal-auth.sh
 
-# 4) 填账号密码与认证地址（存进 /etc/config/campus，权限 600）
+# 2) 填门户地址/账号/密码/哈希方式（存进 /etc/config/campus，权限 600）
 /etc/campus-portal-auth.sh --setup
 
-# 5) 手动跑一次验证
-/etc/campus-portal-auth.sh
+# 3) 确认哈希方式：把输出和抓包里 pass= 后面那 32 位比对
+/etc/campus-portal-auth.sh --hash-test
 
-# 6) 装成自动：WAN 一上线就认证 + 每 5 分钟兜底
+# 4) 手动跑一次验证（--force 跳过"已在线"判断，强制走完整登录流程）
+/etc/campus-portal-auth.sh --force
+
+# 5) 装成自动：WAN 一上线就认证 + 每 5 分钟兜底
 /etc/campus-portal-auth.sh --install-hook
 ```
+
+换学校改这些（`uci campus.main.*`，也接受同名环境变量覆盖）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `auth_url` | 空（必填） | 门户**基地址**，如 `http://10.30.100.5`（不带路径） |
+| `api_paths` | `/api/login.php,/api/ack_auth.php,/api/stat.php` | 按顺序提交的接口；**单接口门户**（如 srun）就写一个 |
+| `extra_fields` | `authmode=0&pool=&isp_id=0&pxyacct=` | 抓包里的固定字段，原样照抄 |
+| `user_field` / `pass_field` | `user` / `pass` | 抓包里的字段名 |
+| `pass_mode` | `md5` | `plain`／`md5`／`md5user`／`md5passuser`／`md5md5` |
+| `pass_md5` | 空 | 设置后直接用这串，跳过哈希（应急用，值从抓包抄） |
+| `pre_get` | `1` | 先 GET 首页拿会话 cookie；实测不带 cookie 会被拒 |
+| `check_url` / `ping_check` | 小米 204 / `223.5.5.5` | 在线判定；`ping_check=-` 表示只用 HTTP 判断 |
 
 认证脚本的约定（自己改也照这个来）：
 
@@ -125,7 +143,16 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 | 已经在线 | 直接 `exit 0`，什么都不做（幂等，cron 反复跑没事） |
 | `--force` | 强制走一次登录流程 |
 | `--quiet` | 不输出（hotplug / cron 用） |
-| 参数来源 | 环境变量优先，其次 `uci get campus.main.{auth_url,user,pass,check_url,ua,iface}` |
+| 参数来源 | 环境变量优先，其次 `uci get campus.main.{auth_url,api_paths,user,pass,pass_mode,...}` |
+
+> 真机跑一次就能定的两点：
+> 1. **哈希方式**：抓包里 `pass` 是 32 位小写 hex，最可能是 `md5(明文)`，但输入未确认——
+>    `--hash-test` 会打印各候选值，和抓包比对即可。
+> 2. **失败响应形态**：故意输错密码那次没抓到，目前失败判定是"任一步 `ret` 非 0 即失败 +
+>    连通性兜底"。补抓一条错密码的 `login.php` 就能换成精确特征串。
+
+（本脚本已对着假门户做过端到端测试：正确密码成功、错密码在第 1 步被拒、缺会话 cookie 被拒、
+哈希配错失败、`pass_md5` 应急通道、在线幂等、hook 装卸 —— 12 项全过。）
 
 ### 第 3 步：验证
 

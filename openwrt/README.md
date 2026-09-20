@@ -121,6 +121,10 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 /etc/campus-portal-auth.sh --install-hook
 ```
 
+> 先在电脑上试（没有 uci）：`--setup` 会自动改存到 `/etc/campus-portal.conf`（权限 600），
+> 也可以直接给环境变量：`PORTAL=10.30.100.5 CAMPUS_USER=账号 CAMPUS_PASS=密码 sh campus-portal-auth.sh --force`
+> （门户地址只填 IP 也行，脚本自动补 `http://`）。要装成开机自动认证，必须在路由器上跑 `--setup`。
+
 换学校改这些（`uci campus.main.*`，也接受同名环境变量覆盖）：
 
 | 参数 | 默认 | 说明 |
@@ -142,6 +146,7 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 | 失败 | `exit 非 0`（hotplug 会重试 3 次） |
 | 已经在线 | 直接 `exit 0`，什么都不做（幂等，cron 反复跑没事） |
 | `--force` | 强制走一次登录流程 |
+| `--hash-test` | 打印各候选哈希；**只能和同一账号的抓包比对**（账号换了就不能比） |
 | `--quiet` | 不输出（hotplug / cron 用） |
 | 参数来源 | 环境变量优先，其次 `uci get campus.main.{auth_url,api_paths,user,pass,pass_mode,...}` |
 

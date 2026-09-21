@@ -110,6 +110,36 @@ wan_mac() {
 mac_nosep() { printf '%s' "$1" | tr -d ':-' | tr 'A-F' 'a-f'; }
 md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 
+# ---------------------------------------------------------------- RAAS 门户的 pass 算法（已逆向确认）
+# 2026-09-21 从门户自己的 JS 里挖出来的（/assets/js/crypto.js 里的 CryptoJS + /tp/school/js/index.js 的 encode()）：
+#   p   = 4 个随机字符（取自 "A-Za-z0-9+" 共 61 个字符，服务端会丢掉这 4 位）
+#   pass= hex( AES-128-ECB( key="5a3b9f207411a8ed"(16 字节 ASCII), 明文 = p + 密码, ZeroPadding ) )
+# 例：p="vh8z" 密码="213511" → fc824d7f244805c56634c66e16ded895（用户抓包里能用那串）
+# 所以它不是哈希而是**加密**：同一个密码每次算出来都不同（前缀随机），服务端解出来丢掉前 4 位即可。
+# 依此：硬编码一个值也能长期用（只要密码不改），但本函数让脚本每次自己算，改密码/换机都不用手工维护。
+RAAS_KEY="${RAAS_KEY:-5a3b9f207411a8ed}"
+RAAS_ALPHA='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+'
+
+raas_encode() {	# raas_encode <明文密码> → 32 位 hex
+	command -v openssl >/dev/null 2>&1 || return 1
+	_keyhex="$(printf '%s' "$RAAS_KEY" | od -An -tx1 | tr -d ' \n')"
+	_nonce=''
+	_i=0
+	while [ "$_i" -lt 4 ]; do
+		_r="$(od -An -N1 -tu1 /dev/urandom 2>/dev/null | tr -d ' ')"
+		[ -n "$_r" ] || _r=$(( ($$ + _i) % 256 ))
+		_idx=$(( _r % 61 ))
+		_nonce="$_nonce$(printf '%s' "$RAAS_ALPHA" | cut -c$((_idx + 1)))"
+		_i=$((_i + 1))
+	done
+	_plain="$_nonce$1"
+	_pad=$(( (16 - ${#_plain} % 16) % 16 ))
+	_i=0
+	{ printf '%s' "$_plain"
+	  while [ "$_i" -lt "$_pad" ]; do printf '\0'; _i=$((_i + 1)); done
+	} | openssl enc -aes-128-ecb -K "$_keyhex" -nopad 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
 # ---------------------------------------------------------------- 子命令
 case "${1:-}" in
 --diag|--show-config)
@@ -154,7 +184,7 @@ case "${1:-}" in
 	printf '门户地址（浏览器打开认证页时的地址，例如 http://10.30.100.5，也可只填 IP）: '; read -r A
 	printf '认证账号（学号/上网账号）: '; read -r U
 	printf '认证密码（明文，脚本会按哈希方式自己算）: '; read -r P
-	printf '哈希方式 [md5/plain/md5user/md5passuser/直接回车=md5]: '; read -r M
+	printf '密码处理方式 [直接回车=raas（本门户的 AES 方案）/ precomputed（直接给 32 位值）/ md5 / plain]: '; read -r M
 	printf '三步认证路径 [直接回车=/api/login.php,/api/ack_auth.php,/api/stat.php]: '; read -r PATHS
 	printf '固定字段 [直接回车=authmode=0&pool=&isp_id=0&pxyacct=]: '; read -r EX
 	A_RAW="$A"
@@ -195,7 +225,7 @@ case "${1:-}" in
 			[ -n "$A" ] && printf ': "${PORTAL:=%s}"\n' "$A"
 			[ -n "$U" ] && printf ': "${CAMPUS_USER:=%s}"\n' "$U"
 			[ -n "$P" ] && printf ': "${CAMPUS_PASS:=%s}"\n' "$P"
-			printf ': "${PASS_MODE:=%s}"\n' "${M:-md5}"
+			printf ': "${PASS_MODE:=%s}"\n' "${M:-raas}"
 			[ -n "${PATHS:-}" ] && printf ': "${API_PATHS:=%s}"\n' "$PATHS"
 			[ -n "${EX:-}" ] && printf ': "${EXTRA_FIELDS:=%s}"\n' "$EX"
 			:	# 保证整块以成功状态结束（上面的 && 短路会返回 1）
@@ -205,6 +235,21 @@ case "${1:-}" in
 		echo "    在这台机器上跑认证/测试没问题；要装成开机自动认证请把脚本搬到路由器上再 --setup"
 	fi
 	echo "提示：下一步跑 --force 真连一次门户看结果；--hash-test 只用于和**同账号**的抓包比对"
+	exit 0
+	;;
+--encode)
+	# 手动算一次 RAAS 的 pass 值：campus-portal-auth.sh --encode 明文密码
+	[ -n "${2:-}" ] || { echo "用法: $SELF --encode <明文密码>"; exit 2; }
+	V="$(raas_encode "$2")"
+	if [ -z "$V" ]; then
+		echo "本机没有 openssl，算不了。两个替代办法：" >&2
+		echo "  1) 路由器上：opkg/apk 装 openssl-util（本仓库固件已自带）" >&2
+		echo "  2) 任何机器：打开门户登录页 → F12 控制台 → 输入 encode('明文密码') → 得到 32 位值，" >&2
+		echo "     再 uci set campus.main.pass_mode=precomputed; uci set campus.main.pass=<那串>" >&2
+		exit 1
+	fi
+	echo "pass 值 : $V"
+	echo "（可直接用：uci set campus.main.pass_mode=precomputed; uci set campus.main.pass=$V）"
 	exit 0
 	;;
 --hash-test)
@@ -329,7 +374,7 @@ env_or_uci API_PATHS    campus.main.api_paths    '/api/login.php,/api/stat.php,/
 env_or_uci EXTRA_FIELDS campus.main.extra_fields 'authmode=0&pool=&isp_id=0&pxyacct='			# ← 抓包③：固定字段
 env_or_uci USER_FIELD   campus.main.user_field   'user'
 env_or_uci PASS_FIELD   campus.main.pass_field   'pass'
-env_or_uci PASS_MODE    campus.main.pass_mode    'md5'
+env_or_uci PASS_MODE    campus.main.pass_mode    'raas'	# raas=AES(前缀+密码) | precomputed=直接给 32 位值 | plain/md5/...
 env_or_uci PASS_MD5     campus.main.pass_md5     ''	# 设置后直接用这串，跳过哈希（应急用）
 env_or_uci PRE_GET      campus.main.pre_get      '1'	# 1=先 GET 首页拿会话 cookie
 # 登录前要 POST 的接口（空 body，只为拿会话/让服务端记住本机 IP）。实测门户是 /api/ip.php；
@@ -347,6 +392,8 @@ COOKIE="${COOKIE:-/tmp/campus-portal.cookie}"
 pass_value() {	# 输出要提交的 pass 值（抓包里 pass= 后面那个）
 	if [ -n "$PASS_MD5" ]; then printf '%s' "$PASS_MD5"; return 0; fi
 	case "$PASS_MODE" in
+		raas)          raas_encode "$CAMPUS_PASS" ;;
+		precomputed)   printf '%s' "$CAMPUS_PASS" ;;	# 直接提交已算好的 32 位值
 		plain|literal) printf '%s' "$CAMPUS_PASS" ;;
 		md5)           md5hex "$CAMPUS_PASS" ;;
 		md5user)       md5hex "$CAMPUS_USER$CAMPUS_PASS" ;;

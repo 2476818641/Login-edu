@@ -481,8 +481,8 @@ ensure_auth_script() {
 	[ -x "$AUTH_SCRIPT" ] && return 0
 	[ "$DRY_RUN" = 1 ] && { msg "    （DRY_RUN：假装认证脚本已就位）"; return 0; }
 	info "    本机没有认证脚本，自动下载到 $AUTH_SCRIPT"
-	for _u in "https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/openwrt/campus-portal-auth.sh" \
-	          "https://raw.githubusercontent.com/2476818641/Login-edu/main/openwrt/campus-portal-auth.sh"; do
+	for _u in "https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/campus-portal-auth.sh" \
+	          "https://raw.githubusercontent.com/2476818641/Login-edu/main/campus-portal-auth.sh"; do
 		if wget -q -O "$AUTH_SCRIPT" "$_u?$(date +%s)" 2>/dev/null && [ -s "$AUTH_SCRIPT" ]; then
 			chmod +x "$AUTH_SCRIPT"
 			grep -q -- '--quick' "$AUTH_SCRIPT" || { warn "下载到的脚本不像新版（没有 --quick），请手动更新"; return 1; }

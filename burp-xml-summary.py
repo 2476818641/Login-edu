@@ -8,11 +8,11 @@
 # 解码 base64、只保留关键头、默认把 cookie/密码值脱敏，输出几 KB 的 Markdown。
 #
 # 用法（VPS / 本机都可以，只依赖 Python 3 标准库）：
-#   python3 burp-xml-summary.py captures/logon.xml                  > 小抄.md
-#   python3 burp-xml-summary.py captures/logon.xml -o 小抄.md
-#   python3 burp-xml-summary.py captures/logon.xml --all            # 不筛，全部条目都留（仍然脱敏）
-#   python3 burp-xml-summary.py captures/logon.xml --no-redact      # 不脱敏（自己看/自己贴给本地模型时用）
-#   python3 burp-xml-summary.py captures/logon.xml --max-body 4000  # 单条 body/响应最多留多少字符
+#   python3 burp-xml-summary.py logon.xml                  > 小抄.md
+#   python3 burp-xml-summary.py logon.xml -o 小抄.md
+#   python3 burp-xml-summary.py logon.xml --all            # 不筛，全部条目都留（仍然脱敏）
+#   python3 burp-xml-summary.py logon.xml --no-redact      # 不脱敏（自己看/自己贴给本地模型时用）
+#   python3 burp-xml-summary.py logon.xml --max-body 4000  # 单条 body/响应最多留多少字符
 #
 # 退出码：0 正常（哪怕一条都没筛出来）／1 参数或文件错误
 

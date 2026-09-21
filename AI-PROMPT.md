@@ -1,6 +1,6 @@
 # AI 提示词：让任意 AI 把 Burp 抓包翻译成认证脚本的填空
 
-配套文件：`captures/README.md`（怎么抓、怎么交付）、`tools/burp-xml-summary.py`（把几十 MB 的 Burp XML 压成几 KB 的小抄）。
+配套文件：`PACKET-CAPTURE.md`（抓包流程）、`burp-xml-summary.py`（把几十 MB 的 Burp XML 压成几 KB 的小抄）。
 本文件的作用：**你不用自己看懂抓包**，把抓包 + 下面这段提示词丢给 AI，让它按固定格式吐出 `campus-portal-auth.sh` 需要的 6 段内容。
 
 ---
@@ -10,15 +10,15 @@
 1. 按 `PACKET-CAPTURE.md` 抓一次包（**必须包含"输错密码失败一次 + 输对成功一次"**）。
 2. Burp → Proxy → HTTP history → 全选 → 右键 `Save items` → 导出为 XML。
 3. 二选一：
-   - **丢文件夹**：把 XML 放进 `/tmp/campus-capture/`（本机），告诉我文件名即可，我来分析；
+   - **丢文件夹**：把 XML 放进本仓库根目录或 `/tmp/`（告诉我文件名即可），我来分析；
    - **贴给 AI**：先跑压缩脚本，再把它生成的 Markdown + 下面的提示词一起贴：
      ```
-     python3 tools/burp-xml-summary.py captures/我的抓包.xml -o captures/小抄.md
+     python3 burp-xml-summary.py 我的抓包.xml -o 小抄.md
      ```
      （`--no-redact` 会把 cookie/密码值也带上；默认是脱敏的，字段名仍然完整——判断字段名够用了。）
 4. 把 AI 输出的 A~F 六段发我，我改进 `campus-portal-auth.sh` 并本地验证。
 
-> 隐私提醒：Burp XML 里含**明文密码、学号、会话 cookie**。默认别提交进 git（`captures/.gitignore` 已挡住非文档文件），贴给外部 AI 前先跑压缩脚本。
+> 隐私提醒：Burp XML 里含**明文密码、学号、会话 cookie**。默认别提交进 git（仓库 `.gitignore` 已挡住 `*.xml` 与 `小抄*.md`），贴给外部 AI 前先跑压缩脚本。
 
 ---
 
@@ -102,6 +102,6 @@
 
 把 XML 放进投放点后，你只要跟我说：
 
-> 抓包已放到 `/tmp/campus-capture/xxu-20260920-wired.xml`，按 `captures/AI-PROMPT.md` 的 A~F 六段分析，然后把 `campus-portal-auth.sh` 的 3 处填空补成正式实现，给我本地验证命令。
+> 抓包已放到 `/tmp/xxu-20260920-wired.xml`，按 `AI-PROMPT.md` 的 A~F 六段分析，然后把 `campus-portal-auth.sh` 的 3 处填空补成正式实现，给我本地验证命令。
 
 我会自己跑压缩脚本、自己判断"这份抓包里有没有认证流量"，然后给你改动 + 验证命令（不会替你编译/刷机）。

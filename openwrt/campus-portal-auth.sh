@@ -42,6 +42,8 @@
 #   campus-portal-auth.sh                 # 已经在线就什么都不做；否则登录一次
 #   campus-portal-auth.sh --force         # 强制走一次登录流程
 #   campus-portal-auth.sh --quiet         # 静默（给 hotplug / cron 用）
+#   campus-portal-auth.sh --quick 账号 密码   # ★傻瓜模式：一键配好+立刻认证+装自动登录
+#   campus-portal-auth.sh --status           # 一句话报告：外网通不通、自动登录装没装
 #   campus-portal-auth.sh --setup         # 交互填门户地址/账号/密码/哈希方式，存进 uci campus
 #   campus-portal-auth.sh --hash-test     # 打印各种候选 MD5，用来和抓包里的 pass= 对比
 #   campus-portal-auth.sh --diag          # 自检：uci 能不能读能写、参数到底从哪来、密码读到没有
@@ -61,6 +63,8 @@ CRONTAB_FILE="${CRONTAB_FILE:-/etc/crontabs/root}"
 SELF="${SELF:-/etc/campus-portal-auth.sh}"
 # 没有 uci 的机器（比如先在电脑上试）用这个文件存配置；--setup 会自动判断该写哪边
 CONF="${CAMPUS_CONF:-/etc/campus-portal.conf}"
+# --quick 用的默认门户地址（本门户实测地址；换学校：改这里，或 PORTAL=http://x.x.x.x 覆盖）
+QUICK_PORTAL="${QUICK_PORTAL:-http://10.30.100.5}"
 HAS_UCI=0
 command -v uci >/dev/null 2>&1 && HAS_UCI=1
 # 配置文件里全是 `: "${VAR:=值}"` 形式 —— 只在该变量还没设过时才赋值，所以环境变量仍然优先
@@ -108,6 +112,14 @@ wan_mac() {
 	printf ''
 }
 mac_nosep() { printf '%s' "$1" | tr -d ':-' | tr 'A-F' 'a-f'; }
+
+# 在线判定（幂等）：能拿到 204 或 ping 通就算在线
+online() {
+	[ "$(curl -s -m 8 -o /dev/null -w '%{http_code}' "${CHECK_URL:-}" 2>/dev/null)" = "204" ] && return 0
+	[ "${PING_TARGET:-}" = "-" ] && return 1
+	ping -c 1 -W 2 "${PING_TARGET:-223.5.5.5}" >/dev/null 2>&1 && return 0
+	return 1
+}
 md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 
 # ---------------------------------------------------------------- RAAS 门户的 pass 算法（已逆向确认）
@@ -138,6 +150,39 @@ raas_encode() {	# raas_encode <明文密码> → 32 位 hex
 	{ printf '%s' "$_plain"
 	  while [ "$_i" -lt "$_pad" ]; do printf '\0'; _i=$((_i + 1)); done
 	} | openssl enc -aes-128-ecb -K "$_keyhex" -nopad 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
+# 装自动登录：WAN 一上线就认证 + 每 5 分钟兜底（--quick 与 --install-hook 共用）
+do_install_hook() {
+	if [ "$HAS_UCI" != 1 ] && [ "${FORCE_HOOK:-0}" != 1 ]; then
+		echo "⚠️  本机没有 uci（不是路由器），跳过自动登录的安装" >&2
+		return 2
+	fi
+	[ -x "$SELF" ] || { echo "先把自己放到 $SELF 并 chmod +x：wget -O $SELF <raw> && chmod +x $SELF"; exit 1; }
+	mkdir -p "$HOOKDIR"
+	cat > "$HOOKFILE" <<-EOF
+	#!/bin/sh
+	# 由 campus-portal-auth.sh --install-hook 生成：WAN 一上线就认证
+	[ "\${ACTION:-}" = "ifup" ] || exit 0
+	case "\${INTERFACE:-}" in
+		wan|wwan) ;;
+		*) [ "\${INTERFACE:-}" = "\$(uci -q get campus.main.iface)" ] || exit 0 ;;
+	esac
+	[ -x "$SELF" ] || exit 0
+	( i=1; while [ "\$i" -le 3 ]; do
+		sleep 5
+		"$SELF" --quiet && { logger -t campus-portal "认证成功（第 \$i 次）"; exit 0; }
+		logger -t campus-portal "第 \$i 次认证失败，重试"; i=\$((i + 1))
+	  done
+	  logger -t campus-portal "认证 3 次都失败，看 logread | grep campus-portal" ) &
+	EOF
+	chmod +x "$HOOKFILE"
+	grep -q "campus-portal-auth.sh" "$CRONTAB_FILE" 2>/dev/null || {
+		mkdir -p "$(dirname "$CRONTAB_FILE")"
+		echo "*/5 * * * * $SELF --quiet" >> "$CRONTAB_FILE"
+	}
+	[ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1
+	echo "已装：$HOOKFILE（WAN 上线认证）+ $CRONTAB_FILE（每 5 分钟兜底）"
 }
 
 # ---------------------------------------------------------------- 子命令
@@ -177,6 +222,67 @@ case "${1:-}" in
 	printf '  密码     : %s\n' "$([ -n "$CAMPUS_PASS" ] && echo "已读到（${#CAMPUS_PASS} 字符）" || echo '（空！← 这就是 --hash-test 说"还没配密码"的原因）')"
 	printf '  哈希方式 : %s\n' "${PASS_MODE:-md5}"
 	printf '  认证路径 : %s\n' "${API_PATHS:-（用脚本内置默认）}"
+	exit 0
+	;;
+--quick|--onekey)
+	# 傻瓜模式：只给账号密码，其余全部按本门户的实测参数配好，然后立刻认证并装自动登录
+	[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
+	U="${2:-}"; P="${3:-}"
+	[ -n "$U" ] || { printf '认证账号: '; read -r U; }
+	if [ -z "$P" ]; then
+		printf '认证密码: '
+		stty -echo 2>/dev/null; read -r P; stty echo 2>/dev/null; echo
+	fi
+	[ -n "$U" ] && [ -n "$P" ] || { echo "账号和密码都不能空"; exit 2; }
+	A="$(normalize_url "${PORTAL:-$QUICK_PORTAL}")"
+	[ -n "$A" ] || { echo "没配门户地址：换学校时用 PORTAL=http://x.x.x.x $SELF --quick 账号 密码"; exit 2; }
+	echo "门户 $A ／ 账号 $U ／ 密码处理 raas（AES）"
+	if [ "$HAS_UCI" = 1 ]; then
+		uci set campus.main='main'
+		uci set campus.main.auth_url="$A"
+		uci set campus.main.user="$U"
+		uci set campus.main.pass="$P"
+		uci set campus.main.pass_mode='raas'
+		uci set campus.main.api_paths='/api/login.php,/api/stat.php,/api/ack_auth.php'
+		uci set campus.main.extra_fields='authmode=0&pool=&isp_id=0&pxyacct='
+		uci set campus.main.pre_paths='/api/ip.php'
+		uci commit campus || { echo "❌ uci commit 失败" >&2; exit 1; }
+		chmod 600 /etc/config/campus 2>/dev/null
+		[ "$(uci -q get campus.main.pass)" = "$P" ] || { echo "❌ 配置没存进去" >&2; exit 1; }
+		echo "✅ 已保存到 uci"
+	else
+		{ printf '# 由 %s --quick 生成（本机没有 uci）\n' "$SELF"
+		  printf ': "${PORTAL:=%s}"\n' "$A"
+		  printf ': "${CAMPUS_USER:=%s}"\n' "$U"
+		  printf ': "${CAMPUS_PASS:=%s}"\n' "$P"
+		  printf ': "${PASS_MODE:=raas}"\n'
+		  printf ': "${API_PATHS:=/api/login.php,/api/stat.php,/api/ack_auth.php}"\n'
+		  printf ': "${EXTRA_FIELDS:=authmode=0&pool=&isp_id=0&pxyacct=}"\n'
+		  printf ': "${PRE_PATHS:=/api/ip.php}"\n'
+		  :
+		} > "$CONF" || { echo "❌ 写 $CONF 失败" >&2; exit 1; }
+		chmod 600 "$CONF"
+		echo "✅ 已保存到 $CONF"
+	fi
+	FORCE=1; QUICK=1
+	;;
+--status)
+	env_or_uci CHECK_URL   campus.main.check_url  'http://connect.rom.miui.com/generate_204'
+	env_or_uci PING_TARGET campus.main.ping_check '223.5.5.5'
+	env_or_uci CAMPUS_USER campus.main.user      ''
+	if online; then
+		echo "✅ 外网是通的（不需要认证）"
+	else
+		echo "❌ 外网不通 —— 需要认证："
+		echo "     $SELF --quick <账号> <密码>     # 一键配好并马上登录"
+	fi
+	if [ -f "$CRONTAB_FILE" ] && grep -q campus-portal-auth "$CRONTAB_FILE" 2>/dev/null; then
+		echo "    自动登录：已装 ✅"
+	else
+		echo "    自动登录：未装（跑 $SELF --quick 账号 密码 或 $SELF --install-hook）"
+	fi
+	[ "$CAMPUS_USER" ] && echo "    已保存账号：$CAMPUS_USER" || echo "    还没配账号"
+	logread 2>/dev/null | grep campus-portal | tail -3 | sed 's/^/    /'
 	exit 0
 	;;
 --setup)
@@ -312,39 +418,11 @@ case "${1:-}" in
 	echo "⚠️ 别拿不同账号的抓包比对；也别连续盲试密码（有些门户会锁账号）"
 	exit 0
 	;;
+
 --install-hook)
 	[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
-	if [ "$HAS_UCI" != 1 ] && [ "${FORCE_HOOK:-0}" != 1 ]; then
-		echo "⚠️  本机没有 uci（不是路由器）：--install-hook 是给路由器装 hotplug + cron 的" >&2
-		echo "    真要在本机装：FORCE_HOOK=1 $SELF --install-hook" >&2
-		exit 2
-	fi
-	[ -x "$SELF" ] || { echo "先把自己放到 $SELF 并 chmod +x：wget -O $SELF <raw> && chmod +x $SELF"; exit 1; }
-	mkdir -p "$HOOKDIR"
-	cat > "$HOOKFILE" <<-EOF
-	#!/bin/sh
-	# 由 campus-portal-auth.sh --install-hook 生成：WAN 一上线就认证
-	[ "\${ACTION:-}" = "ifup" ] || exit 0
-	case "\${INTERFACE:-}" in
-		wan|wwan) ;;
-		*) [ "\${INTERFACE:-}" = "\$(uci -q get campus.main.iface)" ] || exit 0 ;;
-	esac
-	[ -x "$SELF" ] || exit 0
-	( i=1; while [ "\$i" -le 3 ]; do
-		sleep 5
-		"$SELF" --quiet && { logger -t campus-portal "认证成功（第 \$i 次）"; exit 0; }
-		logger -t campus-portal "第 \$i 次认证失败，重试"; i=\$((i + 1))
-	  done
-	  logger -t campus-portal "认证 3 次都失败，看 logread | grep campus-portal" ) &
-	EOF
-	chmod +x "$HOOKFILE"
-	grep -q "campus-portal-auth.sh" "$CRONTAB_FILE" 2>/dev/null || {
-		mkdir -p "$(dirname "$CRONTAB_FILE")"
-		echo "*/5 * * * * $SELF --quiet" >> "$CRONTAB_FILE"
-	}
-	[ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1
-	echo "已装：$HOOKFILE（WAN 上线认证）+ $CRONTAB_FILE（每 5 分钟兜底）"
-	exit 0
+	do_install_hook && exit 0
+	exit 2
 	;;
 --uninstall-hook)
 	[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
@@ -411,13 +489,6 @@ pass_value() {	# 输出要提交的 pass 值（抓包里 pass= 后面那个）
 	esac
 }
 
-# ---------------------------------------------------------------- 在线判定（幂等）
-online() {
-	[ "$(curl -s -m 8 -o /dev/null -w '%{http_code}' "$CHECK_URL" 2>/dev/null)" = "204" ] && return 0
-	[ "$PING_TARGET" = "-" ] && return 1
-	ping -c 1 -W 2 "$PING_TARGET" >/dev/null 2>&1 && return 0
-	return 1
-}
 if [ "$FORCE" != 1 ] && online; then
 	say "已经在线，不用登录"
 	exit 0
@@ -473,7 +544,7 @@ PASSV="$(pass_value)"
 say "提交账号 ${CAMPUS_USER}（pass=${PASS_MODE}${PASS_MD5:+，用 uci 里指定的哈希}）"
 
 STEP=0
-LAST_MSG=""; LAST_RET=""; LAST_TYPE=""; FAILED=0
+LAST_MSG=""; LAST_RET=""; LAST_TYPE=""; OK_MSG=""; FAILED=0
 for _path in $(printf '%s' "$API_PATHS" | tr ',' ' '); do
 	[ -n "$_path" ] || continue
 	STEP=$((STEP + 1))
@@ -492,6 +563,9 @@ for _path in $(printf '%s' "$API_PATHS" | tr ',' ' '); do
 	TYPE="$(json_num "$RESP" type)"
 	say "  [$STEP] $_path → ret=${RET:-?} msg=${MSG:-（空）}${TYPE:+ type=$TYPE}"
 	LAST_MSG="$MSG"; LAST_RET="$RET"; LAST_TYPE="$TYPE"
+	case "$MSG" in
+		*'成功'*|*'success'*|*'SUCCESS'*|*'已在线'*) OK_MSG="$MSG" ;;
+	esac
 	if [ -n "$RET" ] && [ "$RET" != 0 ]; then
 		# 失败码对照（来自 2026-09-20 第二次抓包，两条错密码实测）：
 		#   ret=4 → msg「帐号密码不正确！」（密码错；两次错密码都是 4）
@@ -513,9 +587,9 @@ done
 # ---------------------------------------------------------------- 3) 判定成功 ← 抓包④：成功标志
 #    实测：最后一步 stat.php 的 msg 是「认证成功！」，且所有步骤 ret=0。
 #    失败样本还没抓到，所以这里采取"ret 非 0 即失败（上面已判）+ 特征串/连通性判成功"的双保险。
-case "$LAST_MSG" in
+case "${OK_MSG:-$LAST_MSG}" in
 	*'成功'*|*'success'*|*'SUCCESS'*|*'已在线'*|*'ok'*|*'OK'*)
-		say "响应含成功标志（msg=$LAST_MSG）";;
+		say "响应含成功标志（msg=${OK_MSG:-$LAST_MSG}）";;
 	*)
 		say "响应里没有明确的成功字样，用连通性兜底判断…"
 		sleep 2
@@ -531,7 +605,14 @@ esac
 sleep 2
 if online; then
 	say "认证成功 ✅"
-	log "auth ok (user=$CAMPUS_USER portal=$PORTAL steps=$STEP msg=$LAST_MSG)"
+	log "auth ok (user=$CAMPUS_USER portal=$PORTAL steps=$STEP msg=${OK_MSG:-$LAST_MSG})"
+	if [ "${QUICK:-0}" = 1 ]; then
+		say ""
+		if do_install_hook; then
+			say "✅ 已装好自动登录：插上网线/重启都会自动认证，掉线每 5 分钟兜底"
+			say "   以后想手动看状态：$SELF --status"
+		fi
+	fi
 	exit 0
 fi
 say "提交了但还不通，检查账号密码/哈希方式（可用 --force 强制重试）"

@@ -5,10 +5,44 @@
 | 脚本 | 干什么 | 需要抓包吗 |
 |---|---|---|
 | **`campus-net-setup.sh`**（主脚本） | 探测现状 → 问接入方式 → 配 **MAC 克隆 / TTL / MTU / UA(UA2F)** → **PPPoE 拨号** → 等 20 秒测外网、报告结果。**不实现网页认证** | 不需要，装上就能跑 |
-| **`campus-portal-auth.sh`**（认证脚本） | 网页认证：提交账号密码、判定成功、装成开机自动登录（`--install-hook`） | **已按一次实测抓包实现**（三步 API + MD5 密码，全部可配）：换个学校通常只改 uci，无需改脚本；想让它适配你的门户，抓包丢进 `captures/`，配 `captures/AI-PROMPT.md` 的提示词让 AI 出结论 |
+| **`campus-portal-auth.sh`**（认证脚本） | 网页认证：`--quick 账号 密码` 一键配好并装上自动登录；`--status` 看状态 | **已按一次实测抓包实现**（三步 API + AES 加密的 pass 字段，全部可配）：换个学校通常只改 uci，无需改脚本；想让它适配你的门户，抓包丢进 `captures/`，配 `captures/AI-PROMPT.md` 的提示词让 AI 出结论 |
 
 抓包相关三件套：`PACKET-CAPTURE.md`（抓包清单）、`captures/`（抓包投放点 + AI 提示词）、`tools/burp-xml-summary.py`（把几十 MB 的 Burp XML 压成几 KB 小抄）。
 有线 WAN、PPPoE、**WiFi STA 无线上联**都覆盖。
+
+---
+
+## 🚀 傻瓜版（推荐：只填账号密码，其余全自动）
+
+**第 1 步 · 下载脚本**（路由器上，复制这一行）：
+
+```sh
+wget -O /etc/campus-portal-auth.sh https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/openwrt/campus-portal-auth.sh && chmod +x /etc/campus-portal-auth.sh
+```
+
+**第 2 步 · 一句搞定**（配置 + 立刻认证 + 装好自动登录）：
+
+```sh
+/etc/campus-portal-auth.sh --quick 你的账号 你的密码
+```
+
+看到 `认证成功 ✅` 就完事了：**以后插上网线、重启都会自动登录**，掉线每 5 分钟自动补一次。
+（密码不想写在命令里也行：只打 `--quick 你的账号`，它会提示你输入，且不回显。）
+
+**第 3 步 · 随时看状态**（可选）：
+
+```sh
+/etc/campus-portal-auth.sh --status
+# ✅ 外网是通的（不需要认证） / ❌ 外网不通 —— 需要认证
+#     自动登录：已装 ✅
+```
+
+| 你会遇到的情况 | 怎么办 |
+|---|---|
+| 改密码了 | 再跑一次 `--quick 账号 新密码` |
+| 换宿舍/换设备了 | 同上（脚本会自己重新算，不需要抓包） |
+| 想知道原理 / 换学校 | 看下面的「完整流程」和参数表 |
+| 想再加 MAC 克隆、TTL、UA 防检测 | 先跑主脚本 `campus-net-setup.sh`（见下） |
 
 ---
 

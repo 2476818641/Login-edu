@@ -33,6 +33,24 @@ sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
 
 看到 `认证完成 ✅（网络伪装 + 网页认证 都已生效）` 就成了。认证脚本**不用你下载**，入口脚本会自动取。
 
+`--quick` 里**只有 MAC 会单独问你一次**（校园网常按 MAC 分配/绑定 IP，默认不改；直接回车即可跳过）：
+
+```
+  ── MAC 地址（校园网常按 MAC 分配/绑定 IP，克隆成已知设备的 MAC 最稳）──
+     当前 WAN MAC（wan）: aa:bb:cc:dd:ee:ff
+     路由器下面这些设备拿过地址，可以参考/直接抄：
+       aa:bb:cc:11:22:33  MyPhone
+    要克隆的 MAC（回车=不改；auto=取上面第一台设备；或填 AA:BB:CC:DD:EE:FF）:
+```
+
+想连这一步也不问（脚本化/远程执行时方便）：
+
+```sh
+CAMPUS_MAC=AA:BB:CC:DD:EE:FF sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
+```
+
+> 提示：`--quick` 在没有终端的环境（管道、cron、`wget | sh`）里不会提问，会自动用默认值，不会卡住。
+
 它按这个顺序做（**先伪装，后认证**）：
 
 ```

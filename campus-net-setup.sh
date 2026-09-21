@@ -25,6 +25,7 @@
 # 非交互（可选）：
 #   CAMPUS_MODE=pppoe CAMPUS_USER=学号 CAMPUS_PASS=密码 sh campus-net-setup.sh
 #   CAMPUS_MODE=portal sh campus-net-setup.sh
+#   CAMPUS_MAC=AA:BB:CC:DD:EE:FF sh campus-net-setup.sh --quick 账号 密码   # 连 MAC 也不问
 #
 # 只改 UCI 配置 + 一个 /etc/nftables.d 里的 nft 规则文件，不装任何软件包。
 # /etc/nftables.d/ 在 firewall4 的 keep.d 里，所以刷固件升级后 TTL 规则仍在。
@@ -76,6 +77,21 @@ ask() {	# ask <提示> <默认值> -> $REPLY
 	[ -z "$REPLY" ] && REPLY="$_d"
 	return 0
 }
+# 只有真终端才提问；管道/非交互环境自动用默认值。
+# ASK_FORCE_TTY=1 是给测试用的钩子：强制认为"有终端"（沙箱里建不了伪终端时用）
+tty_ok() { [ "${ASK_FORCE_TTY:-0}" = 1 ] && return 0; [ -t 0 ] && [ -t 1 ]; }
+ask_always() {	# 与 ask 相同，但 **--quick 模式下也会问**（没终端时仍走默认值）
+	_p="$1"; _d="${2:-}"
+	if [ "$AUTO" != 1 ] || tty_ok; then
+		if [ -n "$_d" ]; then printf '%s [%s]: ' "$_p" "$_d"; else printf '%s: ' "$_p"; fi
+		if ! read -r REPLY; then REPLY=""; fi
+		[ -z "$REPLY" ] && REPLY="$_d"
+		return 0
+	fi
+	REPLY="$_d"
+	msg "$_p ${_d:+→ $_d}（非交互环境，用默认值）"
+	return 0
+}
 uget() { uci -q get "$1" 2>/dev/null; }
 
 [ "$(id -u)" = 0 ] || die "请用 root 运行（需要改网络与防火墙配置）"
@@ -83,6 +99,8 @@ command -v uci >/dev/null 2>&1 || die "找不到 uci —— 这个脚本要在 O
 
 if [ "${AUTO:-0}" = 1 ]; then
 	info "一键模式：伪装走推荐默认值，认证用你给的账号（账号：${CAMPUS_USER:-稍后输入}）"
+	msg "    MAC 地址会单独问你一次（校园网常按 MAC 绑定；不想改就直接回车）"
+	msg "    想全自动不提问：CAMPUS_MAC=AA:BB:CC:DD:EE:FF sh $0 --quick 账号 密码"
 fi
 
 # ---------------------------------------------------------------- 0) 探测现状
@@ -218,8 +236,20 @@ fi
 info "2/4 配置 MAC / TTL / MTU / UA"
 
 # --- 2.1 MAC 克隆
-ask "    要克隆的 MAC（回车=不改，auto=用当前 DHCP 租约里第一台设备）" ""
-CLONE_MAC="$REPLY"
+msg ""
+msg "  ── MAC 地址（校园网常按 MAC 分配/绑定 IP，克隆成已知设备的 MAC 最稳）──"
+msg "     当前 WAN MAC（$WANDEV）: $(cat "$SYSFS/$WANDEV/address" 2>/dev/null || echo 未知)"
+if [ -s /tmp/dhcp.leases ]; then
+	msg "     路由器下面这些设备拿过地址，可以参考/直接抄："
+	awk 'NF>=3 && $2 ~ /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/ {printf "       %s  %s\n", $2, ($4 != "*" ? $4 : "")}' /tmp/dhcp.leases 2>/dev/null | head -5
+fi
+CLONE_MAC="${CAMPUS_MAC:-}"		# 可用环境变量直接给：CAMPUS_MAC=AA:BB:... sh campus-net-setup.sh --quick 账号 密码
+if [ -n "$CLONE_MAC" ]; then
+	msg "     MAC 使用环境变量 CAMPUS_MAC=$CLONE_MAC"
+else
+	ask_always "    要克隆的 MAC（回车=不改；auto=取上面第一台设备；或填 AA:BB:CC:DD:EE:FF）" ""
+	CLONE_MAC="$REPLY"
+fi
 case "$CLONE_MAC" in
 auto|AUTO)
 	CLONE_MAC="$(awk 'NF>=3 && $2 ~ /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/ {print $2; exit}' /tmp/dhcp.leases 2>/dev/null)"

@@ -133,7 +133,7 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 | `api_paths` | `/api/login.php,/api/ack_auth.php,/api/stat.php` | 按顺序提交的接口；**单接口门户**（如 srun）就写一个 |
 | `extra_fields` | `authmode=0&pool=&isp_id=0&pxyacct=` | 抓包里的固定字段，原样照抄 |
 | `user_field` / `pass_field` | `user` / `pass` | 抓包里的字段名 |
-| `pass_mode` | `md5` | `plain`／`md5`／`md5user`／`md5passuser`／`md5md5` |
+| `pass_mode` | `raas` | `raas`＝本门户的 AES 方案（每次随机前缀+加密，推荐）／`precomputed`＝直接给 32 位值／`plain`／`md5` 等 |
 | `pass_md5` | 空 | 设置后直接用这串，跳过哈希（应急用，值从抓包抄） |
 | `pre_get` | `1` | 先 GET 首页拿会话 cookie；实测不带 cookie 会被拒 |
 | `check_url` / `ping_check` | 小米 204 / `223.5.5.5` | 在线判定；`ping_check=-` 表示只用 HTTP 判断 |
@@ -154,29 +154,36 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 > 已经确定 / 还差的：
 > 1. **失败形态已确定**（第二次抓包拿到）：密码错就是 `{"ret":4,"data":{"type":0},"msg":"帐号密码不正确！"}`，
 >    脚本已对 `ret=4` 给专门提示；其它非 0 码按通用失败处理。
-> 2. ⚠️ **哈希输入还没定，而且比想象的复杂**：同一账号两次成功登录提交的 `pass` **不一样**
->    （`c88a20f6…` vs `c3d33fb1…`）。若这期间密码没改过，说明哈希里掺了每次都会变的东西
->    （认证页下发的盐/challenge）——即 `md5(盐+明文)` 之类，`pass_mode=md5` 就不够用，
->    需要认证页 JS 里的算法。**先用 `--hash-test` 对比**：能对上就用对应 `pass_mode`；对不上就把认证页 HTML 与它引用的 JS 发来。
+> 2. ✅ **`pass` 字段已破译 —— 不是哈希，是 AES 加密**（详见下面第 5 条）。
 > 3. 认证成功后浏览器跳 `baidu.com` 是**页面 JS 自己跳的**（门户响应里没有任何 302/Location），
 >    脚本不用模拟；该窗口内也没看到周期请求，心跳保活暂按"未知"处理（cron 兜底仍在）。
 > 4. **流程已按一份"实测能上网"的手写脚本对齐**：前置多一步 `POST /api/ip.php`（空 body，
 >    该接口看起来是让服务端记录客户端 IP），默认顺序改为 `login → stat → ack_auth`
 >    （浏览器抓包是 `login → ack → stat`，两者都能过 ⇒ 后两步顺序不敏感）。
-> 5. 哈希仍未破解：已知明文 `213511` ↔ 哈希 `fc824d7f244805c56634c66e16ded895`，
->    用 `tools/md5-probe.py` 试了 **6.7 万种**常见拼法（账号/门户/常见盐/分隔符/顺序/双重 md5/大小写）全部未命中
->    ⇒ 盐不是常量文本，最可能是**客户端 IP**（所以才有 `/api/ip.php`）。
->    （校园网"IP 绑 MAC"的话，盐也可能是 MAC —— 脚本与探针都已经把 MAC 及相关组合纳入候选，
->      含 `md5(明文+MAC)`、`md5(明文+MAC无分隔符)`、`md5(明文+IP+MAC)` 等。
->      路由器上直接一条命令就能判定：`/etc/campus-portal-auth.sh --hash-test <抓包里的哈希>`，
->      它会拿本机真实 WAN IP/MAC 算完并标出命中的 `pass_mode`。）
->    拿到 `POST /api/ip.php` 返回的 IP 后再跑一次探针即可确认：
->    `python3 tools/md5-probe.py --plain 213511 --hash fc824d… --user 05261241 --host 10.30.100.5 --salt <IP>`
->    ⚠️ 若哈希确实绑定客户端 IP，那**硬编码哈希只在 IP 不变时有效**，换 IP/重拨就会失效。
+> 5. ✅ **`pass` 字段已完全破译（2026-09-21）——它不是哈希，是加密。**
+>    从门户自己的 JS 里挖出来的（`/assets/js/crypto.js` 里的 CryptoJS + `/tp/school/js/index.js` 的 `encode()`）：
+>
+>    ```js
+>    // 4 位随机前缀（服务端会丢掉这 4 位；每位取自 61 字符表 A-Za-z0-9+）
+>    var p = ''; for (var i=0;i<4;i++) p += 'ABC…xyz0123456789+'[Math.floor(Math.random()*61)];
+>    pass = hex( AES-128-ECB( key = "5a3b9f207411a8ed"(16 字节 ASCII),
+>                             明文 = p + 明文密码, ZeroPadding ) );
+>    // 特例：输入本来就是 32 位 [0-9A-Za-z] 时原样提交（所以硬编码一个值也能长期用）
+>    ```
+>
+>    验证：抓到的 5 个 `pass` 值全部用该算法解回「4 位前缀 + 明文密码 + 全零填充」，
+>    且两次"成功"的值解出**同一个密码** ⇒ 之前"同账号不同哈希"只是随机前缀不同，密码从没变过。
+>    例：`fc824d7f244805c56634c66e16ded895` → 解密 → `vh8z` + `213511` + 零填充。
+>
+>    **结论：与 IP/MAC 无关**，硬编码的值只在**改密码**时失效。脚本现在能自己算：
+>    `pass_mode=raas`（默认，用固件自带的 `openssl-util` 每次生成新前缀再加密；本仓库固件已含 `openssl-util - 3.5.6-r1`）；
+>    也可以 `pass_mode=precomputed` 直接提交现成的 32 位值。
+>    手动算一次：`/etc/campus-portal-auth.sh --encode 明文密码`；
+>    或在任何机器上打开门户登录页 → F12 控制台 → `encode('明文密码')`。
 
 （本脚本已对着复刻实测流程的假门户做过端到端测试：正确密码三步成功、错密码 `ret=4` 被拒并给出
 正确提示、缺会话 cookie 被拒、哈希配错失败、`pass_md5` 应急通道、在线幂等、hook 装卸、
-请求头/字段与抓包逐字一致 —— 20 项全过。）
+请求头/字段与抓包逐字一致、`raas` 加密（假门户用真算法解密校验）、`--encode` —— **32 项全过**。）
 
 ### 第 3 步：验证
 

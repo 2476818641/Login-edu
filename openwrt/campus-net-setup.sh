@@ -3,7 +3,10 @@
 #
 # campus-net-setup.sh —— 校园网接入配置（主脚本）
 #
-# 只做两件事：**配置** + **PPPoE 拨号**。网页认证不在这里，见同目录 campus-portal-auth.sh。
+# 一条流水线：**先做网络伪装（MAC/TTL/MTU/UA）→ 再自动做网页认证**。
+# 认证逻辑在同目录 campus-portal-auth.sh 里（没装会自动下载），所以本脚本是唯一入口：
+#   sh campus-net-setup.sh --quick 账号 密码     # 全自动：伪装 + 认证 + 装自动登录
+#   或直接跑：sh campus-net-setup.sh             # 交互式，网页认证的账号密码会在中途问你要
 #
 # 做什么：
 #   1) 探测现状：上网接口 / 默认路由 / MAC / MTU / TTL 规则 / UA2F
@@ -39,6 +42,18 @@ SYSFS="${SYSFS:-/sys/class/net}"		# 可覆盖，便于测试
 LOG_TAG="campus-setup"
 CAMPUS_MODE="${CAMPUS_MODE:-}"
 
+# --quick 账号 [密码]：一条命令跑完（伪装用推荐默认值 + 用你给的账号做网页认证）
+case "${1:-}" in
+--quick|--onekey|-q)
+	AUTO=1
+	CAMPUS_MODE="${CAMPUS_MODE:-portal}"
+	CAMPUS_USER="${2:-${CAMPUS_USER:-}}"
+	CAMPUS_PASS="${3:-${CAMPUS_PASS:-}}"
+	shift $(( $# > 3 ? 3 : $# ))
+	;;
+esac
+CAMPUS_USER="${CAMPUS_USER:-}"; CAMPUS_PASS="${CAMPUS_PASS:-}"
+
 msg()  { printf '%s\n' "$*"; }
 info() { printf '\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[!] %s\033[0m\n' "$*"; }
@@ -48,8 +63,14 @@ run() {	# 干跑模式只打印
 	if [ "$DRY_RUN" = 1 ]; then printf '    [dry-run] %s\n' "$*"; else "$@"; fi
 }
 log() { [ "$DRY_RUN" = 1 ] || logger -t "$LOG_TAG" "$*" 2>/dev/null || true; }
+AUTO="${AUTO:-0}"		# 1=不提问，全部采用默认值（--quick 用）
 ask() {	# ask <提示> <默认值> -> $REPLY
 	_p="$1"; _d="${2:-}"
+	if [ "$AUTO" = 1 ]; then
+		REPLY="$_d"
+		msg "$_p ${_d:+→ $_d}（--quick 用默认值）"
+		return 0
+	fi
 	if [ -n "$_d" ]; then printf '%s [%s]: ' "$_p" "$_d"; else printf '%s: ' "$_p"; fi
 	if ! read -r REPLY; then REPLY=""; fi
 	[ -z "$REPLY" ] && REPLY="$_d"
@@ -59,6 +80,10 @@ uget() { uci -q get "$1" 2>/dev/null; }
 
 [ "$(id -u)" = 0 ] || die "请用 root 运行（需要改网络与防火墙配置）"
 command -v uci >/dev/null 2>&1 || die "找不到 uci —— 这个脚本要在 OpenWrt 路由器上运行"
+
+if [ "${AUTO:-0}" = 1 ]; then
+	info "一键模式：伪装走推荐默认值，认证用你给的账号（账号：${CAMPUS_USER:-稍后输入}）"
+fi
 
 # ---------------------------------------------------------------- 0) 探测现状
 # 上网接口怎么定（优先级从高到低）：
@@ -132,7 +157,7 @@ fi
 info "1/4 选择接入方式"
 if [ -z "$CAMPUS_MODE" ]; then
 	msg "    1) PPPoE（要账号密码，本脚本直接配好并拨号）"
-	msg "    2) 网页认证（本脚本只配网络；认证用 campus-portal-auth.sh，需要先抓包生成）"
+	msg "    2) 网页认证（本机已是本门户的实测实现：配完网络会自动接着做认证）"
 	msg "    3) 我已经用 WiFi 连上校园网了（uplink 是无线 STA，出口走 wwan）"
 	ask "    你的方式" "2"
 	case "$REPLY" in
@@ -153,7 +178,7 @@ if [ -n "${WIFI_UPLINK:-}" ]; then
 	WANIF="$REPLY"
 	WANDEV="$(uget network.$WANIF.device)"; [ -z "$WANDEV" ] && WANDEV="$WANIF"
 	msg "    ⚠️ WiFi 上联一样要认证：校园无线通常也是网页认证（Dr.COM / 深澜那套）"
-	msg "      1) 网页认证（默认；认证脚本要按抓包生成）"
+	msg "      1) 网页认证（默认；配完网络会自动接着做认证）"
 	msg "      2) PPPoE（少数学校的无线也走拨号）"
 	msg "      3) 不用认证（家里测试 / 学校直接放行）"
 	ask "    无线上联的认证方式" "1"
@@ -171,6 +196,22 @@ if [ "$CAMPUS_MODE" = "pppoe" ]; then
 	[ -z "$PPPOE_USER" ] && { ask "    PPPoE 账号（学号）" ""; PPPOE_USER="$REPLY"; }
 	[ -z "$PPPOE_PASS" ] && { ask "    PPPoE 密码" ""; PPPOE_PASS="$REPLY"; }
 	[ -n "$PPPOE_USER" ] || die "PPPoE 账号不能为空"
+fi
+
+# 网页认证：就地收集账号密码，稍后（伪装配置完 → 测完网）自动接着认证
+if [ "$AUTH_REQUIRED" = 1 ] && [ "$CAMPUS_MODE" = "portal" ]; then
+	if [ -z "${CAMPUS_USER:-}" ] && [ "$DRY_RUN" != 1 ]; then
+		msg ""
+		msg "  ── 网页认证要用的账号（回车=稍后再填，先只做网络伪装）──"
+		ask "    认证账号（学号/上网账号）" ""
+		CAMPUS_USER="$REPLY"
+		if [ -n "$CAMPUS_USER" ]; then
+			printf '    认证密码: '
+			stty -echo 2>/dev/null; read -r CAMPUS_PASS; stty echo 2>/dev/null; echo
+		fi
+	fi
+elif [ -z "${CAMPUS_USER:-}" ] && [ "$CAMPUS_MODE" = "pppoe" ]; then
+	: # PPPoE 的账号在上面那段处理
 fi
 
 # ---------------------------------------------------------------- 2) 配 MAC / TTL / MTU / UA
@@ -433,7 +474,43 @@ fi
 info "4/4 等待 ${WAIT_SECS} 秒后检测外网"
 [ "$DRY_RUN" = 1 ] || sleep "$WAIT_SECS"
 
+# 认证脚本：没装就自动下载（用户只需要认识主脚本这一个入口）
+AUTH_SCRIPT="${AUTH_SCRIPT:-/etc/campus-portal-auth.sh}"
+AUTH_OK=0
+ensure_auth_script() {
+	[ -x "$AUTH_SCRIPT" ] && return 0
+	[ "$DRY_RUN" = 1 ] && { msg "    （DRY_RUN：假装认证脚本已就位）"; return 0; }
+	info "    本机没有认证脚本，自动下载到 $AUTH_SCRIPT"
+	for _u in "https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/openwrt/campus-portal-auth.sh" \
+	          "https://raw.githubusercontent.com/2476818641/Login-edu/main/openwrt/campus-portal-auth.sh"; do
+		if wget -q -O "$AUTH_SCRIPT" "$_u?$(date +%s)" 2>/dev/null && [ -s "$AUTH_SCRIPT" ]; then
+			chmod +x "$AUTH_SCRIPT"
+			grep -q -- '--quick' "$AUTH_SCRIPT" || { warn "下载到的脚本不像新版（没有 --quick），请手动更新"; return 1; }
+			msg "    已就位：$AUTH_SCRIPT"
+			return 0
+		fi
+	done
+	warn "    自动下载失败（没网/被墙），手动：wget -O $AUTH_SCRIPT <raw 链接> && chmod +x $AUTH_SCRIPT"
+	return 1
+}
+run_portal_auth() {
+	[ "$DRY_RUN" = 1 ] && { msg "    （DRY_RUN：跳过真正的认证）"; return 0; }
+	ensure_auth_script || return 1
+	if [ -n "${CAMPUS_USER:-}" ] && [ -n "${CAMPUS_PASS:-}" ]; then
+		"$AUTH_SCRIPT" --quick "$CAMPUS_USER" "$CAMPUS_PASS" && AUTH_OK=1
+	elif [ -n "${CAMPUS_USER:-}" ]; then
+		"$AUTH_SCRIPT" --quick "$CAMPUS_USER" && AUTH_OK=1
+	else
+		msg "    （没给账号，认证脚本会问你要一次）"
+		"$AUTH_SCRIPT" --quick && AUTH_OK=1
+	fi
+	return $([ "$AUTH_OK" = 1 ] && echo 0 || echo 1)
+}
+
 check_net() {
+	# 测试/调试用：强制认为通或不通（CAMPUS_FORCE_OFFLINE=1 / CAMPUS_FORCE_ONLINE=1）
+	[ "${CAMPUS_FORCE_OFFLINE:-0}" = 1 ] && return 1
+	[ "${CAMPUS_FORCE_ONLINE:-0}" = 1 ] && return 0
 	ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && return 0
 	_c="$(curl -s -m 8 -o /dev/null -w '%{http_code}' http://www.baidu.com 2>/dev/null)"
 	[ "$_c" = "200" ] && return 0
@@ -445,26 +522,34 @@ if check_net; then
 	msg "    出口 IP : $(curl -s -m 8 http://ip.3322.net 2>/dev/null || echo 取不到)"
 	[ "${UA_ENABLED:-0}" = 1 ] && msg "    验 UA   : 浏览器打开 http://ua-check.stagoh.com/ 看 User-Agent（UA3F 默认会把该站显示成 UA3F）"
 	if [ "${AUTH_REQUIRED:-1}" = 1 ]; then
-		msg "    提示     : 还没跑过网页认证，但外网已通（学校可能直接放行，或已认证过）"
-		msg "               要让它在掉线后自动补认证：campus-portal-auth.sh --install-hook"
+		msg "    提示     : 外网已通（学校可能直接放行，或已认证过）"
+		if ensure_auth_script && [ "$DRY_RUN" != 1 ]; then
+			if [ -n "${CAMPUS_USER:-}" ] && [ -n "${CAMPUS_PASS:-}" ]; then
+				msg "    顺手把账号存好并装好自动登录（掉线后自己补认证）"
+				"$AUTH_SCRIPT" --quick "$CAMPUS_USER" "$CAMPUS_PASS" >/dev/null 2>&1
+				msg "    已装：$AUTH_SCRIPT --status 可查看"
+			else
+				msg "    想让它掉线后自动补认证：  $AUTH_SCRIPT --quick 账号 密码"
+			fi
+		fi
 	fi
 else
 	warn "还没通"
 	if [ "${AUTH_REQUIRED:-1}" = 1 ]; then
 		U="$(curl -s -m 8 -o /dev/null -w '%{redirect_url}' http://connect.rom.miui.com/generate_204 2>/dev/null)"
 		[ -n "$U" ] && msg "    认证页地址：$U"
-		cat <<'EOF'
-    网页认证不在本脚本里做 —— 认证流程要按你学校的抓包来，见 campus-portal-auth.sh：
-
-      1) 抓一次登录包（清单：PACKET-CAPTURE.md，用 Burp 或浏览器 F12）
-      2) 把抓包交给 AI（或自己按「← 抓包」标注填）生成/补全 /etc/campus-portal-auth.sh
-      3) wget -O /etc/campus-portal-auth.sh <raw 链接> && chmod +x /etc/campus-portal-auth.sh
-      4) 手动验证一次：/etc/campus-portal-auth.sh
-      5) 装成开机自动登录：/etc/campus-portal-auth.sh --install-hook
-EOF
+		msg ""
+		msg "  ── 伪装已配好，接着做网页认证 ──"
+		run_portal_auth
+		if [ "${AUTH_OK:-0}" = 1 ]; then
+			info "认证完成 ✅（网络伪装 + 网页认证 都已生效）"
+		else
+			warn "认证没成功，看上面的输出；常见原因：账号密码错 / 已欠费 / 学校在维护"
+			msg "    重试：$AUTH_SCRIPT --quick 账号 密码"
+			msg "    看状态：$AUTH_SCRIPT --status"
+		fi
 		if [ -n "${WIFI_UPLINK:-}${WIRELESS_UPLINK:-}" ]; then
-			msg "    无线上联注意：认证接口有时要带 mac 参数，用你克隆上去的那个 MAC；"
-			msg "                  另外 STA 掉线重连后如果又不通，多半是要重新认证（--install-hook 的 cron 会补）"
+			msg "    无线上联注意：STA 掉线重连后可能又要认证一次（--install-hook 的 cron 每 5 分钟兜底）"
 		fi
 	elif [ "$CAMPUS_MODE" = "pppoe" ]; then
 		warn "PPPoE 没拨上：检查账号密码、是否需要 VLAN、以及 VLAN ID"

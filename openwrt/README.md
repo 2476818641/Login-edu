@@ -12,39 +12,48 @@
 
 ---
 
-## 🚀 傻瓜版（推荐：只填账号密码，其余全自动）
+## 🚀 傻瓜版（推荐：一条命令，先伪装后认证）
 
-**第 1 步 · 下载脚本**（路由器上，复制这一行）：
+**只需要认识一个脚本**：`campus-net-setup.sh`（认证脚本没装时会**自动下载**）。
+一条命令跑完「网络伪装 → 网页认证 → 装好自动登录」：
 
 ```sh
-wget -O /etc/campus-portal-auth.sh https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/openwrt/campus-portal-auth.sh && chmod +x /etc/campus-portal-auth.sh
+# 第 1 步：下载主脚本（就这一行）
+wget -O /tmp/campus-net-setup.sh https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/openwrt/campus-net-setup.sh
+
+# 第 2 步：一条命令跑完（伪装用推荐默认值，认证用你给的账号）
+sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
 ```
 
-**第 2 步 · 一句搞定**（配置 + 立刻认证 + 装好自动登录）：
+看到 `认证完成 ✅（网络伪装 + 网页认证 都已生效）` 就成了。它按这个顺序做：
 
-```sh
-/etc/campus-portal-auth.sh --quick 你的账号 你的密码
+```
+1/4 选择接入方式          网页认证（--quick 自动选）
+2/4 网络伪装              MAC（默认不改）→ MTU → TTL（UA3F 优先，内核 nft 兜底）→ UA3F（UA/L3 重写/Desync）
+3/4 应用配置              uci commit → network restart → fw4 reload
+4/4 等 20 秒测外网        ── 通了：完成（顺手存账号+装自动登录）
+                          └─ 不通：自动接着做网页认证（三步 API + AES 的 pass），成功后装 hotplug+cron
 ```
 
-看到 `认证成功 ✅` 就完事了：**以后插上网线、重启都会自动登录**，掉线每 5 分钟自动补一次。
-（密码不想写在命令里也行：只打 `--quick 你的账号`，它会提示你输入，且不回显。）
-
-**第 3 步 · 随时看状态**（可选）：
+想先看清楚它要改什么（不落盘、不断网）：
 
 ```sh
-/etc/campus-portal-auth.sh --status
-# ✅ 外网是通的（不需要认证） / ❌ 外网不通 —— 需要认证
-#     自动登录：已装 ✅
+DRY_RUN=1 sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
+```
+
+**随时查状态**：
+
+```sh
+/etc/campus-portal-auth.sh --status     # 外网通不通 / 自动登录装没装 / 最近认证日志
 ```
 
 | 你会遇到的情况 | 怎么办 |
 |---|---|
 | 改密码了 | 再跑一次 `--quick 账号 新密码` |
-| 换宿舍/换设备了 | 同上（脚本会自己重新算，不需要抓包） |
-| 想知道原理 / 换学校 | 看下面的「完整流程」和参数表 |
-| 想再加 MAC 克隆、TTL、UA 防检测 | 先跑主脚本 `campus-net-setup.sh`（见下） |
-
----
+| 想改伪装项（MAC/TTL/MTU/UA） | 去掉 `--quick` 跑交互式：`sh /tmp/campus-net-setup.sh` |
+| 换学校 | `PORTAL=http://新门户 sh ... --quick 账号 密码`，或交互式里改 |
+| 只想单独重做认证 | `/etc/campus-portal-auth.sh --quick 账号 密码` |
+| 想知道原理 / 自己抓包适配 | 看下面的「完整流程」与参数表 |
 
 ## 完整流程
 

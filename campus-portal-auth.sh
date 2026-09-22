@@ -152,6 +152,42 @@ raas_encode() {	# raas_encode <明文密码> → 32 位 hex
 	} | openssl enc -aes-128-ecb -K "$_keyhex" -nopad 2>/dev/null | od -An -tx1 | tr -d ' \n'
 }
 
+# 写校园网配置：**直接写 /etc/config/campus**，不用 `uci set cfg.sec=type` 那套建段语法。
+# 为什么（2026-09-21 真机实测）：ImmortalWrt 25.12 的 uci CLI 上 `uci set campus.main='main'`
+# 及其后续的 `uci set campus.main.x=y` 全部报 "uci: Entry not found"，commit 也失败 —— 整条链写不进去。
+# 直接写文件 + 读回校验最稳：读回来对得上才算成功（写错了不会谎报）。
+uci_escape() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+
+# CAMPUS_UCI_FILE 可覆盖（默认 /etc/config/campus），仅供测试/多份配置共存时用
+write_campus_config() {	# write_campus_config <portal> <user> <pass> [pass_mode] [api_paths] [extra_fields] [pre_paths]
+	_f="${CAMPUS_UCI_FILE:-/etc/config/campus}"
+	_p="$(uci_escape "${1:-}")"; _u="$(uci_escape "${2:-}")"; _w="$(uci_escape "${3:-}")"
+	_m="$(uci_escape "${4:-raas}")"
+	_ap="$(uci_escape "${5:-/api/login.php,/api/stat.php,/api/ack_auth.php}")"
+	_ex="$(uci_escape "${6:-authmode=0&pool=&isp_id=0&pxyacct=}")"
+	_pre="$(uci_escape "${7:-/api/ip.php}")"
+	_tmp="$_f.tmp.$$"
+	{
+		printf '%s\n' '# 由 campus-portal-auth.sh 生成（--quick/--setup）；含明文密码，权限 600'
+		printf '%s\n' "config main 'main'"
+		printf "\toption auth_url '%s'\n" "$_p"
+		printf "\toption user '%s'\n" "$_u"
+		printf "\toption pass '%s'\n" "$_w"
+		printf "\toption pass_mode '%s'\n" "$_m"
+		printf "\toption api_paths '%s'\n" "$_ap"
+		printf "\toption extra_fields '%s'\n" "$_ex"
+		printf "\toption pre_paths '%s'\n" "$_pre"
+	} > "$_tmp" || return 1
+	mv -f "$_tmp" "$_f" || { rm -f "$_tmp"; return 1; }
+	chmod 600 "$_f" 2>/dev/null
+	# 读回校验（uci 只负责解析这个文件；就算它的 commit 不支持也不影响）
+	if command -v uci >/dev/null 2>&1; then
+		[ "$(uci -q get campus.main.pass 2>/dev/null)" = "$3" ] || return 1
+		uci -q commit campus 2>/dev/null || true
+	fi
+	return 0
+}
+
 # 装自动登录：WAN 一上线就认证 + 每 5 分钟兜底（--quick 与 --install-hook 共用）
 do_install_hook() {
 	if [ "$HAS_UCI" != 1 ] && [ "${FORCE_HOOK:-0}" != 1 ]; then
@@ -238,18 +274,10 @@ case "${1:-}" in
 	[ -n "$A" ] || { echo "没配门户地址：换学校时用 PORTAL=http://x.x.x.x $SELF --quick 账号 密码"; exit 2; }
 	echo "门户 $A ／ 账号 $U ／ 密码处理 raas（AES）"
 	if [ "$HAS_UCI" = 1 ]; then
-		uci set campus.main='main'
-		uci set campus.main.auth_url="$A"
-		uci set campus.main.user="$U"
-		uci set campus.main.pass="$P"
-		uci set campus.main.pass_mode='raas'
-		uci set campus.main.api_paths='/api/login.php,/api/stat.php,/api/ack_auth.php'
-		uci set campus.main.extra_fields='authmode=0&pool=&isp_id=0&pxyacct='
-		uci set campus.main.pre_paths='/api/ip.php'
-		uci commit campus || { echo "❌ uci commit 失败" >&2; exit 1; }
-		chmod 600 /etc/config/campus 2>/dev/null
-		[ "$(uci -q get campus.main.pass)" = "$P" ] || { echo "❌ 配置没存进去" >&2; exit 1; }
-		echo "✅ 已保存到 uci"
+		write_campus_config "$A" "$U" "$P" raas \
+			'/api/login.php,/api/stat.php,/api/ack_auth.php' 'authmode=0&pool=&isp_id=0&pxyacct=' '/api/ip.php' \
+			|| { echo "❌ 写 /etc/config/campus 失败（或读回来对不上）" >&2; exit 1; }
+		echo "✅ 已保存到 /etc/config/campus（读回校验通过）"
 	else
 		{ printf '# 由 %s --quick 生成（本机没有 uci）\n' "$SELF"
 		  printf ': "${PORTAL:=%s}"\n' "$A"
@@ -300,29 +328,10 @@ case "${1:-}" in
 		*) echo "门户地址没带协议，已按 $A 处理" ;;
 	esac
 	if [ "$HAS_UCI" = 1 ]; then
-		# 这里**故意不加 -q**：错误信息必须能看见（历史教训：-q 把报错吞了，
-		# 脚本还照样打印"已保存"，用户完全不知道没存进去）
-		SETFAIL=0
-		uci set campus.main='main' || SETFAIL=1
-		[ -n "$A" ] && { uci set "campus.main.auth_url=$A" || SETFAIL=1; }
-		[ -n "$U" ] && { uci set "campus.main.user=$U" || SETFAIL=1; }
-		[ -n "$P" ] && { uci set "campus.main.pass=$P" || SETFAIL=1; }
-		[ -n "${M:-}" ] && { uci set "campus.main.pass_mode=$M" || SETFAIL=1; }
-		[ -n "${PATHS:-}" ] && { uci set "campus.main.api_paths=$PATHS" || SETFAIL=1; }
-		[ -n "${EX:-}" ] && { uci set "campus.main.extra_fields=$EX" || SETFAIL=1; }
-		[ "$SETFAIL" = 0 ] || { echo "❌ uci set 失败（看上面报错）" >&2; exit 1; }
-		# 关键：commit 之后**读回来核对**，不能像以前那样不管成败都打印"已保存"
-		if ! uci commit campus; then
-			echo "❌ uci commit campus 失败（配置没保存）" >&2
-			exit 1
-		fi
-		chmod 600 /etc/config/campus 2>/dev/null
-		BACK="$(uci -q get campus.main.pass)"
-		if [ "$BACK" != "$P" ]; then
-			echo "❌ 写进去又读回来对不上（读到：${BACK:-空}）——配置没生效，别继续" >&2
-			exit 1
-		fi
-		echo "已保存到 uci campus（/etc/config/campus，权限 600），门户地址=$A，账号=$U"
+		# 直接写文件（见 write_campus_config 的注释：25.12 的 uci set 建段会报 Entry not found）
+		write_campus_config "$A" "$U" "$P" "${M:-raas}" "${PATHS:-}" "${EX:-}" "" \
+			|| { echo "❌ 写 /etc/config/campus 失败（或读回来对不上，看上面报错）" >&2; exit 1; }
+		echo "已保存到 /etc/config/campus（读回校验通过），门户地址=$A，账号=$U"
 	else
 		# 没有 uci：写一个可 source 的配置文件（电脑上先用它验证，注意不是路由器）
 		{

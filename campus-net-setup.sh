@@ -37,7 +37,7 @@ set -u
 
 DRY_RUN="${DRY_RUN:-0}"
 WAIT_SECS="${WAIT_SECS:-20}"
-TTL_VALUE="${TTL_VALUE:-64}"
+TTL_VALUE="${TTL_VALUE:-}"	# 空 = 自动（与 UA3F 里已有的值保持一致，避免两处打架）
 TTL_FILE="${TTL_FILE:-/etc/nftables.d/10-ttl-fix.nft}"
 SYSFS="${SYSFS:-/sys/class/net}"		# 可覆盖，便于测试
 LOG_TAG="campus-setup"
@@ -282,6 +282,11 @@ fi
 DEF_MTU=1500
 [ "$CAMPUS_MODE" = "pppoe" ] && DEF_MTU=1492
 [ -n "${WIFI_UPLINK:-}${WIRELESS_UPLINK:-}" ] && DEF_MTU=keep	# 无线侧 MTU 由 AP 决定，别乱改
+# --quick：本机已经配过 MTU 就**保持不动**（改错 MTU 会让部分网站打不开/卡死）
+if [ "$AUTO" = 1 ]; then
+	_curmtu="$(uget "network.$WANIF.mtu")"
+	[ -n "$_curmtu" ] && { DEF_MTU=keep; msg "    本机 MTU 已是 $_curmtu，--quick 保持不动（想改请跑交互式）"; }
+fi
 ask "    MTU（回车=$DEF_MTU，不想改就填 keep）" "$DEF_MTU"
 MTU="$REPLY"
 if [ "$MTU" != "keep" ] && [ -n "$MTU" ]; then
@@ -301,6 +306,17 @@ UA_IMPL=""
 TTL_BY_NFT=1
 
 # --- 2.3 TTL
+# 统一 TTL：UA3F 的 L3 重写和这里的内核 nft 兜底改的是同一个字段，值不一致会互相打架。
+# 自动选取：环境变量 TTL_VALUE > UA3F 里已有的值 > 64
+if [ -z "$TTL_VALUE" ]; then
+	_ua3fttl="$(uget ua3f.main.l3_rewrite_ttl_value)"
+	if [ -n "$_ua3fttl" ]; then
+		TTL_VALUE="$_ua3fttl"
+		msg "    本机 UA3F 里 TTL 已设为 $_ua3fttl → 内核兜底也用同一个值（避免两处不一致）"
+	else
+		TTL_VALUE=64
+	fi
+fi
 if [ "$UA_IMPL" = "ua3f" ]; then
 	msg "    检测到 UA3F：TTL / IPID / TCP 这些 L3 特征交给它做"
 	ask "    要不要【另外】再加一条内核 nft 兜底（全流量含 ICMP/UDP，零开销）(y/N)" "y"
@@ -372,7 +388,8 @@ ua3f)
 		case "$REPLY" in
 		1|y|Y|yes|是)
 			run uci set ua3f.main.l3_rewrite_ttl='1'
-			ask "      TTL 目标值" "$(uget ua3f.main.l3_rewrite_ttl_value)"; [ -z "$REPLY" ] && REPLY=64
+			ask "      TTL 目标值" "$TTL_VALUE"; [ -z "$REPLY" ] && REPLY="$TTL_VALUE"
+			[ "$REPLY" = "$TTL_VALUE" ] || warn "      注意：UA3F=$REPLY 而内核兜底仍是 $TTL_VALUE，两处不一致可能互相打架（建议一致）"
 			run uci set "ua3f.main.l3_rewrite_ttl_value=$REPLY" ;;
 		*) run uci set ua3f.main.l3_rewrite_ttl='0' ;;
 		esac
@@ -507,20 +524,47 @@ info "4/4 等待 ${WAIT_SECS} 秒后检测外网"
 # 认证脚本：没装就自动下载（用户只需要认识主脚本这一个入口）
 AUTH_SCRIPT="${AUTH_SCRIPT:-/etc/campus-portal-auth.sh}"
 AUTH_OK=0
+# 找认证脚本：① 目标位置 ② 入口脚本同目录（用户通常把两个放一起）③ /root ④ /tmp ⑤ 当前目录
+# 只有都找不到才尝试下载 —— 而且**必须设超时**：认证前本来就没网，无超时的 wget 会卡死（2026-09-21 真机踩到）
 ensure_auth_script() {
 	[ -x "$AUTH_SCRIPT" ] && return 0
-	[ "$DRY_RUN" = 1 ] && { msg "    （DRY_RUN：假装认证脚本已就位）"; return 0; }
-	info "    本机没有认证脚本，自动下载到 $AUTH_SCRIPT"
-	for _u in "https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/campus-portal-auth.sh" \
-	          "https://raw.githubusercontent.com/2476818641/Login-edu/main/campus-portal-auth.sh"; do
-		if wget -q -O "$AUTH_SCRIPT" "$_u?$(date +%s)" 2>/dev/null && [ -s "$AUTH_SCRIPT" ]; then
-			chmod +x "$AUTH_SCRIPT"
-			grep -q -- '--quick' "$AUTH_SCRIPT" || { warn "下载到的脚本不像新版（没有 --quick），请手动更新"; return 1; }
-			msg "    已就位：$AUTH_SCRIPT"
+	_selfdir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+	for _c in "$_selfdir/campus-portal-auth.sh" "./campus-portal-auth.sh" \
+	          /root/campus-portal-auth.sh /tmp/campus-portal-auth.sh "$HOME/campus-portal-auth.sh"; do
+		[ -n "$_c" ] && [ -f "$_c" ] || continue
+		[ -x "$AUTH_SCRIPT" ] && break
+		msg "    找到认证脚本：$_c"
+		if [ "$DRY_RUN" = 1 ]; then msg "    （DRY_RUN：不复制）"; return 0; fi
+		if cp -f "$_c" "$AUTH_SCRIPT" 2>/dev/null && chmod +x "$AUTH_SCRIPT" 2>/dev/null; then
+			msg "    已装到 $AUTH_SCRIPT"
 			return 0
 		fi
+		warn "    复制到 $AUTH_SCRIPT 失败，直接用找到的那份"
+		AUTH_SCRIPT="$_c"
+		return 0
 	done
-	warn "    自动下载失败（没网/被墙），手动：wget -O $AUTH_SCRIPT <raw 链接> && chmod +x $AUTH_SCRIPT"
+	[ "$DRY_RUN" = 1 ] && { msg "    （DRY_RUN：跳过下载）"; return 0; }
+	info "    本机没有认证脚本，尝试下载（每个源最多 8 秒，失败不纠缠）"
+	for _u in "https://cdn.jsdelivr.net/gh/2476818641/Login-edu@main/campus-portal-auth.sh" \
+	          "https://raw.githubusercontent.com/2476818641/Login-edu/main/campus-portal-auth.sh"; do
+		# -T 8 超时、-t 1 不重试：没认证前根本没网，卡住比失败更糟
+		if wget -q -T 8 -t 1 -O "$AUTH_SCRIPT" "$_u" 2>/dev/null && [ -s "$AUTH_SCRIPT" ]; then
+			chmod +x "$AUTH_SCRIPT"
+			if grep -q -- '--quick' "$AUTH_SCRIPT"; then
+				msg "    已装到 $AUTH_SCRIPT"
+				return 0
+			fi
+			warn "    下载到的脚本不像新版（没有 --quick），继续尝试下一个源"
+			rm -f "$AUTH_SCRIPT"
+		fi
+	done
+	rm -f "$AUTH_SCRIPT" 2>/dev/null
+	warn "    没有认证脚本，也下载失败（认证前没网是正常的）"
+	msg  "    手动装法（用能上网的电脑/手机下载后传到路由器）："
+	msg  "      1) 下载 campus-portal-auth.sh"
+	msg  "      2) 传到路由器，和 campus-net-setup.sh 放同一个目录（例如都放 /root）"
+	msg  "         或者直接放到 /etc/campus-portal-auth.sh"
+	msg  "      3) 再跑一次本脚本即可（它会自动找到并装好）"
 	return 1
 }
 run_portal_auth() {

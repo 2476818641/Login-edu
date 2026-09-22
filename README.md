@@ -68,12 +68,16 @@ sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
 > 结果是：加速器连不上、Steam 无法下载 —— 真机实测就是这个原因（UA3F 统计表里能看到
 > `Valve/Steam HTTP Client 1.0`、`HttpDns`、`allawntech`（迅游）、`KCG-PD`、`Microsoft-CryptoAPI` 等都被改写成了 Chrome UA）。
 >
+> 奇游加速器同理：它的 UA 是 `PC/Windows/windows10.0.22621.4249x64/10/QeeYouAcceler-PC/7.2.0/E8F408BCAC3C`，
+> 跑在 `report.qiyou.cn` / `nsnode.qiyou.cn` / `qy-game-policy-conf.oss-cn-hangzhou.aliyuncs.com` 上，
+> 被改写成 Chrome/Edg UA 后就废了。**正表下它天然不受影响**（不在改写名单里），反表已按 `QeeYouAcceler` + 域名 `qiyou` 放行。
+>
 > 所以脚本默认用**正表**：只把"路由器/命令行"这类会暴露共享的 UA 改写成 PC UA，其余一律放行。
 >
 > | 规则集 | 行为 | 适用 |
 > |---|---|---|
 > | **`whitelist`（正表，默认）** | 只改写 `uclient/Wget/curl/Go-http-client/BusyBox/OpenWrt/aria2…` 这类 UA；`FINAL=DIRECT` 放行其余 | **推荐**：兼容性最好，Steam/加速器/HttpDns 都不受影响 |
-> | `blacklist`（反表） | 默认统一改写，仅对列出的协议敏感流量放行（Steam / 迅游 / 加速器 SDK / HttpDns / Windows 证书与联网探测） | 学校确实会按"UA 多样性"判断共享时用 |
+> | `blacklist`（反表） | 默认统一改写，仅对列出的协议敏感流量放行（官方那 5 个 + Steam / **奇游 qiyou** / 迅游 / 加速器 SDK / HttpDns / Windows 证书与联网探测） | 学校确实会按"UA 多样性"判断共享时用 |
 > | `all`（全局） | 全部改写（UA3F 原始默认） | 兼容性最差，不推荐 |
 >
 > 切换方式（随时可换，不碰网络和认证）：
@@ -98,7 +102,7 @@ sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
 >
 > 规则表就是 UCI 里的一段 JSON（`ua3f.main.header_rewrite`），也能在 LuCI「服务→UA3F」可视化编辑。
 > 验证有没有生效：LuCI 那个页面里的**「请求 Header 实时统计」**，对比"原文 UA / 改写后 UA"两列 ——
-> 正表下只有路由器/命令行类会被改，Steam/加速器的原文与改写后应当**一致**。
+> 正表下只有路由器/命令行类会被改，Steam/奇游/迅游等加速器的原文与改写后应当**一致**（奇游看 `QeeYouAcceler` 那一行）。
 >
 > 另外注意 `top` 里 UA3F 的 `VSZ 1300m / %VSZ 566%` 是 **Go 预留的虚拟地址空间，不是真实占用**；
 > 真实内存看 `cat /proc/$(pidof ua3f)/status | grep VmRSS`（通常几十 MB，256MB 的路由器够用）。

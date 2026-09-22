@@ -132,16 +132,50 @@ md5hex() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 RAAS_KEY="${RAAS_KEY:-5a3b9f207411a8ed}"
 RAAS_ALPHA='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+'
 
-raas_encode() {	# raas_encode <明文密码> → 32 位 hex
-	command -v openssl >/dev/null 2>&1 || return 1
-	_keyhex="$(printf '%s' "$RAAS_KEY" | od -An -tx1 | tr -d ' \n')"
+# 把二进制转成小写 hex。本仓库固件的 busybox **没有编 od**（真机实测 "od: not found"），
+# 所以这里按可用性依次回退：od → hexdump -e → hexdump -C → base64+awk（coreutils-base64 固件自带）。
+# 每种都用真实字节探测一次，探测通过才用它 —— 不同固件编的 applet 不一样，硬编码某一个必翻车。
+hexify() {
+	if command -v od >/dev/null 2>&1; then
+		if [ "$(printf '\001' | od -An -tx1 | tr -d ' \n')" = "01" ]; then od -An -tx1 | tr -d ' \n'; return 0; fi
+	fi
+	if command -v hexdump >/dev/null 2>&1; then
+		if [ "$(printf '\001\002' | hexdump -v -e '1/1 "%02x"' 2>/dev/null)" = "0102" ]; then
+			hexdump -v -e '1/1 "%02x"'; return 0
+		fi
+		if printf '\001\002' | hexdump -v -C 2>/dev/null | grep -q '01 02'; then
+			# canonical 格式：<偏移> 01 02 ... |ascii|  → 只留中间那串 hex
+			sed 's/^[0-9a-fA-F]*  *//; s/  *|.*$//' | tr -d ' \n'; return 0
+		fi
+	fi
+	if command -v base64 >/dev/null 2>&1; then
+		base64 | awk '
+			BEGIN { B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" }
+			{
+				for (i = 1; i <= length($0); i++) {
+					v = index(B64, substr($0, i, 1)) - 1
+					if (v < 0) continue
+					n = n * 64 + v; bits += 6
+					if (bits >= 8) { bits -= 8; printf "%02x", int(n / 2^bits) % 256; n = n % 2^bits }
+				}
+			}'
+		return 0
+	fi
+	return 1
+}
+
+raas_encode() {	# raas_encode <明文密码> → 32 位 hex；失败原因写进 RAAS_ERR
+	RAAS_ERR=""
+	if ! command -v openssl >/dev/null 2>&1; then RAAS_ERR="没有 openssl（装 openssl-util）"; return 1; fi
+	_keyhex="$(printf '%s' "$RAAS_KEY" | hexify 2>/dev/null)"
+	if [ -z "$_keyhex" ]; then RAAS_ERR="没有可用的 hex 转换工具（od/hexdump/base64 都没有）"; return 1; fi
 	_nonce=''
 	_i=0
 	while [ "$_i" -lt 4 ]; do
-		_r="$(od -An -N1 -tu1 /dev/urandom 2>/dev/null | tr -d ' ')"
+		_r="$(hexdump -v -n 1 -e '"%u"' /dev/urandom 2>/dev/null)"
+		[ -n "$_r" ] || _r="$(printf '%s' "$(date +%N 2>/dev/null)" | sed 's/[^0-9]//g' | cut -c1-3)"
 		[ -n "$_r" ] || _r=$(( ($$ + _i) % 256 ))
-		_idx=$(( _r % 61 ))
-		_nonce="$_nonce$(printf '%s' "$RAAS_ALPHA" | cut -c$((_idx + 1)))"
+		_nonce="$_nonce$(printf '%s' "$RAAS_ALPHA" | cut -c$(( _r % 61 + 1 )))"
 		_i=$((_i + 1))
 	done
 	_plain="$_nonce$1"
@@ -149,7 +183,7 @@ raas_encode() {	# raas_encode <明文密码> → 32 位 hex
 	_i=0
 	{ printf '%s' "$_plain"
 	  while [ "$_i" -lt "$_pad" ]; do printf '\0'; _i=$((_i + 1)); done
-	} | openssl enc -aes-128-ecb -K "$_keyhex" -nopad 2>/dev/null | od -An -tx1 | tr -d ' \n'
+	} | openssl enc -aes-128-ecb -K "$_keyhex" -nopad 2>/dev/null | hexify
 }
 
 # 写校园网配置：**直接写 /etc/config/campus**，不用 `uci set cfg.sec=type` 那套建段语法。
@@ -357,7 +391,7 @@ case "${1:-}" in
 	[ -n "${2:-}" ] || { echo "用法: $SELF --encode <明文密码>"; exit 2; }
 	V="$(raas_encode "$2")"
 	if [ -z "$V" ]; then
-		echo "本机没有 openssl，算不了。两个替代办法：" >&2
+		echo "算不了：${RAAS_ERR:-未知原因}。两个替代办法：" >&2
 		echo "  1) 路由器上：opkg/apk 装 openssl-util（本仓库固件已自带）" >&2
 		echo "  2) 任何机器：打开门户登录页 → F12 控制台 → 输入 encode('明文密码') → 得到 32 位值，" >&2
 		echo "     再 uci set campus.main.pass_mode=precomputed; uci set campus.main.pass=<那串>" >&2
@@ -552,42 +586,64 @@ done
 PASSV="$(pass_value)"
 say "提交账号 ${CAMPUS_USER}（pass=${PASS_MODE}${PASS_MD5:+，用 uci 里指定的哈希}）"
 
+# 门户自己的 JS（raas.js）里的语义，照抄过来：
+#   login.php: ret 0/3/121/122 → 继续（它把 3/121/122 都当成功，然后调 ack_auth）；ret 4 → 账号密码不正确
+#   stat.php : ret 2/3/4 → 还在处理中，继续轮询（JS 里 timeout 默认 10 次）
+RET_ACCEPT="0 3 121 122"
+RET_RETRY="2 3 4"
+RET_MAX_TRY="${RET_MAX_TRY:-6}"
+RET_SLEEP="${RET_SLEEP:-3}"
+ret_in() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
 STEP=0
+TOTAL_STEPS=$(printf '%s' "$API_PATHS" | tr ',' ' ' | wc -w)
 LAST_MSG=""; LAST_RET=""; LAST_TYPE=""; OK_MSG=""; FAILED=0
 for _path in $(printf '%s' "$API_PATHS" | tr ',' ' '); do
 	[ -n "$_path" ] || continue
 	STEP=$((STEP + 1))
 	case "$_path" in /*) _url="$PORTAL$_path" ;; *) _url="$PORTAL/$_path" ;; esac
-	RESP="$(curl_auth -b "$COOKIE" -c "$COOKIE" \
-		-H 'X-Requested-With: XMLHttpRequest' \
-		-H "Referer: $PORTAL/" -H "Origin: $PORTAL" \
-		-X POST "$_url" \
-		--data-urlencode "$USER_FIELD=$CAMPUS_USER" \
-		--data-urlencode "$PASS_FIELD=$PASSV" \
-		--data "$EXTRA_FIELDS" \
-		2>/dev/null)"
-	RESP="$(json_strip_jsonp "$RESP")"
-	RET="$(json_num "$RESP" ret)"
-	MSG="$(json_str "$RESP" msg)"
-	TYPE="$(json_num "$RESP" type)"
-	say "  [$STEP] $_path → ret=${RET:-?} msg=${MSG:-（空）}${TYPE:+ type=$TYPE}"
-	LAST_MSG="$MSG"; LAST_RET="$RET"; LAST_TYPE="$TYPE"
-	case "$MSG" in
-		*'成功'*|*'success'*|*'SUCCESS'*|*'已在线'*) OK_MSG="$MSG" ;;
-	esac
-	if [ -n "$RET" ] && [ "$RET" != 0 ]; then
-		# 失败码对照（来自 2026-09-20 第二次抓包，两条错密码实测）：
-		#   ret=4 → msg「帐号密码不正确！」（密码错；两次错密码都是 4）
-		#   其它非 0 → 原样打印，等补抓样本再对照
-		case "$RET" in
-			4) say "认证被拒绝：账号或密码不正确（ret=4 msg=$MSG）"
-			   say "  → 先用 --hash-test 核对哈希方式；账号本身没错的话基本就是哈希算错了" ;;
-			*) say "认证被拒绝：$_path 返回 ret=$RET msg=$MSG" ;;
+	_try=0
+	while :; do
+		_try=$((_try + 1))
+		RESP="$(curl_auth -b "$COOKIE" -c "$COOKIE" \
+			-H 'X-Requested-With: XMLHttpRequest' \
+			-H "Referer: $PORTAL/" -H "Origin: $PORTAL" \
+			-X POST "$_url" \
+			--data-urlencode "$USER_FIELD=$CAMPUS_USER" \
+			--data-urlencode "$PASS_FIELD=$PASSV" \
+			--data "$EXTRA_FIELDS" \
+			2>/dev/null)"
+		RESP="$(json_strip_jsonp "$RESP")"
+		RET="$(json_num "$RESP" ret)"
+		MSG="$(json_str "$RESP" msg)"
+		TYPE="$(json_num "$RESP" type)"
+		say "  [$STEP/$TOTAL_STEPS] $_path → ret=${RET:-?} msg=${MSG:-（空）}${TYPE:+ type=$TYPE}$([ "$_try" -gt 1 ] && echo "（第 $_try 次）")"
+		LAST_MSG="$MSG"; LAST_RET="$RET"; LAST_TYPE="$TYPE"
+		case "$MSG" in
+			*'成功'*|*'success'*|*'SUCCESS'*|*'已在线'*) OK_MSG="$MSG" ;;
 		esac
+		[ -z "$RET" ] && break			# 没 ret 字段：交给后面的连通性判定
+		ret_in "$RET" "$RET_ACCEPT" && break	# 0/3/121/122 = 已接受，继续下一步
+		# 第一步（login）返回 4 = 账号密码不正确（两次错密码实测都是 4）
+		if [ "$STEP" = 1 ] && [ "$RET" = 4 ]; then
+			say "账号或密码不正确（ret=4 msg=$MSG）"
+			say "  → 密码没输错的话，用 --hash-test 核对密码处理方式；或换 --setup 重新填一次"
+			log "auth rejected at $(_path): ret=4 (bad credentials)"
+			FAILED=1
+			break
+		fi
+		# 后续步骤（stat/ack）返回 2/4/3 = 还在处理中 → 等一会再问（门户 JS 也是这么轮询的）
+		if ret_in "$RET" "$RET_RETRY" && [ "$_try" -lt "$RET_MAX_TRY" ]; then
+			say "    处理中（ret=$RET $MSG），${RET_SLEEP} 秒后再问一次"
+			sleep "$RET_SLEEP"
+			continue
+		fi
+		say "认证被拒绝：$_path 返回 ret=$RET msg=$MSG"
 		log "auth rejected at step $STEP ($_path): ret=$RET msg=$MSG"
 		FAILED=1
 		break
-	fi
+	done
+	[ "$FAILED" = 1 ] && break
 done
 
 [ "$FAILED" = 1 ] && exit 1

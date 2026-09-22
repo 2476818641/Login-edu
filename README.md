@@ -246,6 +246,11 @@ wget -O /etc/campus-portal-auth.sh $B/campus-portal-auth.sh && chmod +x /etc/cam
 | `--quiet` | 不输出（hotplug / cron 用） |
 | 参数来源 | 环境变量优先，其次 `uci get campus.main.{auth_url,api_paths,user,pass,pass_mode,...}` |
 
+> **门户的结果码语义**（照抄门户自己的 JS `raas.js`，别自己想当然）：
+> `0 / 3 / 121 / 122` = 已接受（它把 3「正在认证…」也当成功继续走 ack_auth）；
+> `stat.php` 返回 `2 / 3 / 4` = 还在处理中 → **继续轮询**（脚本默认每 3 秒问一次、最多 6 次）；
+> `login.php` 返回 `4` = 账号密码不正确（两条错密码实测都是 4）。
+>
 > 已经确定 / 还差的：
 > 1. **失败形态已确定**（第二次抓包拿到）：密码错就是 `{"ret":4,"data":{"type":0},"msg":"帐号密码不正确！"}`，
 >    脚本已对 `ret=4` 给专门提示；其它非 0 码按通用失败处理。

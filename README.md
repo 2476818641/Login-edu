@@ -47,10 +47,20 @@ sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
 > `/etc/campus-portal-auth.sh`），找不到才尝试下载（每个源最多 8 秒，失败不纠缠）。
 > 因为**认证前本来就没网**，建议一开始就把两个文件一起传到路由器同一目录，最省事。
 
-> **UA3F 的开销**：`--quick` 默认把服务模式设成 **NFQUEUE**（而不是 TPROXY）。
-> TPROXY 会把**全部流量**绕本机代理一遍（loopback 收发各一次），在 MT7981 上实测 `sys 60%+ / io 20%+`、负载 4+；
-> NFQUEUE 只把包交给内核队列，开销低得多。内核 ≥5.15 时还会默认打开 `l3_rewrite_bpf_offload`（eBPF 卸载）再省一层。
-> 想强制用 TPROXY：`UA3F_MODE=TPROXY sh ... --quick ...`；这次完全不想动 UA3F：`SKIP_UA3F=1 sh ... --quick ...`。
+> **UA3F 服务模式（以真机实测为准）**：`--quick` 默认设成 **REDIRECT**。
+>
+> | 模式 | 本机实测 | 说明 |
+> |---|---|---|
+> | **REDIRECT** | ✅ **可行**（UA 确实被改写） | 脚本默认 |
+> | TPROXY | ❌ **不行**（UA 没被改写）且最贵 | 全部流量绕本机代理一遍（loopback 收发各一次），实测 `sys 60%+ / io 20%+`、负载 4+ |
+> | NFQUEUE | 未实测 | 开销最低，想省 CPU 可以自己试：`UA3F_MODE=NFQUEUE` |
+>
+> 换模式：`UA3F_MODE=TPROXY sh ... --quick ...`（或直接 `uci set ua3f.main.server_mode='REDIRECT'`）。
+> 这次完全不想动 UA3F：`SKIP_UA3F=1 sh ... --quick ...`。
+> 内核 ≥5.15 时会默认打开 `l3_rewrite_bpf_offload`（eBPF 卸载）省一层 CPU。
+>
+> 脚本跑完会**自动自检 UA 是否真被改写**（访问 ua-check 站点找 UA3F 标记）；没看到会提示换模式 —— 这条正是发现
+> "TPROXY 不生效"的方式，别再靠猜。
 >
 > 另外注意 `top` 里 UA3F 的 `VSZ 1300m / %VSZ 566%` 是 **Go 预留的虚拟地址空间，不是真实占用**；
 > 真实内存看 `cat /proc/$(pidof ua3f)/status | grep VmRSS`（通常几十 MB，256MB 的路由器够用）。

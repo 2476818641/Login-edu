@@ -369,11 +369,14 @@ case "$UA_IMPL" in
 ua3f)
 	CUR_EN="$(uget ua3f.enabled.enabled)"; [ -z "$CUR_EN" ] && CUR_EN=1
 	CUR_MODE="$(uget ua3f.main.server_mode)"; [ -z "$CUR_MODE" ] && CUR_MODE=NFQUEUE
-	# TPROXY 会把**所有流量**绕本机代理一遍（loopback 收发各一次），MT7981 上实测 sys 60%+、io 20%+；
-	# NFQUEUE 只把包交给内核队列处理，开销低得多。所以 --quick 默认用 NFQUEUE。
+	# 服务模式怎么选（以真机实测为准）：
+	#   REDIRECT —— 本机实测**可行**（UA 确实被改写），本脚本默认用它
+	#   TPROXY   —— 本机实测**不行**（UA 没被改写）而且最贵：全部流量绕本机代理一遍
+	#               （loopback 收发各一次），实测 sys 60%+ / io 20%+ / 负载 4+
+	#   NFQUEUE  —— 开销最低，理论上可用；本机没实测过，想省 CPU 可以自己试
 	if [ "$AUTO" = 1 ] && [ "$SKIP_UA3F" != 1 ]; then
-		[ -n "$UA3F_MODE" ] && NEW_MODE="$UA3F_MODE" || NEW_MODE="NFQUEUE"
-		[ "$CUR_MODE" != "$NEW_MODE" ] && msg "    UA3F 服务模式：$CUR_MODE → $NEW_MODE（$([ "$NEW_MODE" = NFQUEUE ] && echo 'NFQUEUE 省 CPU，TPROXY 会把全部流量绕本机代理' || echo '按 UA3F_MODE 指定'))"
+		[ -n "$UA3F_MODE" ] && NEW_MODE="$UA3F_MODE" || NEW_MODE="REDIRECT"
+		[ "$CUR_MODE" != "$NEW_MODE" ] && msg "    UA3F 服务模式：$CUR_MODE → $NEW_MODE（$([ -n "$UA3F_MODE" ] && echo "按 UA3F_MODE 指定" || echo "默认用本机实测可行的 REDIRECT；TPROXY 实测不改写 UA 且最贵")）"
 		CUR_MODE="$NEW_MODE"
 	fi
 	CUR_UA="$(uget ua3f.main.ua)"; [ -z "$CUR_UA" ] && CUR_UA=FFF
@@ -386,8 +389,9 @@ ua3f)
 	case "$REPLY" in
 	1|y|Y|yes|是)
 		UA_ENABLED=1
-		msg "    服务模式：NFQUEUE=老 UA2F 那套（开销最低，推荐）/ TPROXY=代理模式（功能全但吃 CPU）"
+		msg "    服务模式：REDIRECT=实测可用（默认）/ NFQUEUE=开销最低（未实测）/ TPROXY=实测不行且最贵"
 		ask "    服务模式" "$CUR_MODE"
+		UA_MODE_USED="$REPLY"
 		case "$REPLY" in
 		NFQUEUE|nfqueue) run uci set ua3f.main.server_mode='NFQUEUE' ;;
 		TPROXY|tproxy)   run uci set ua3f.main.server_mode='TPROXY' ;;
@@ -665,6 +669,19 @@ else
 		warn "无线上联没通：先看是不是没关联上/没拿到地址"
 		msg "    看 STA 状态：iwinfo | head -20 ; ifstatus $WANIF | head -20"
 		msg "    如果学校是要认证的，把认证脚本装上：campus-portal-auth.sh（见 PACKET-CAPTURE.md）"
+	fi
+fi
+
+# UA 改写自检：只有联网后才做（用 ua-check 站点看它收到的 UA 里有没有 UA3F 标记）
+if [ "${UA_ENABLED:-0}" = 1 ] && [ "$DRY_RUN" != 1 ] && check_net; then
+	info "UA 改写自检（UA3F，模式 ${UA_MODE_USED:-?}）"
+	if curl -s -m 10 https://ua-check.stagoh.com/ 2>/dev/null | grep -q 'UA3F'; then
+		msg "    ✅ 该站看到了 UA3F 标记 —— UA 改写确实生效"
+	else
+		warn "    ❌ 没看到 UA3F 标记 —— UA 可能没被改写"
+		msg "    先确认规则表非空：uci get ua3f.main.header_rewrite（空的话去 LuCI「服务→UA3F」恢复默认规则）"
+		msg "    还不行就换模式（本机实测 REDIRECT 可行、TPROXY 不行）："
+		msg "      uci set ua3f.main.server_mode='REDIRECT'; uci commit ua3f; /etc/init.d/ua3f restart"
 	fi
 fi
 

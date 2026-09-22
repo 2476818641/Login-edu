@@ -26,6 +26,8 @@
 #   CAMPUS_MODE=pppoe CAMPUS_USER=学号 CAMPUS_PASS=密码 sh campus-net-setup.sh
 #   CAMPUS_MODE=portal sh campus-net-setup.sh
 #   CAMPUS_MAC=AA:BB:CC:DD:EE:FF sh campus-net-setup.sh --quick 账号 密码   # 连 MAC 也不问
+#   UA3F_MODE=NFQUEUE sh campus-net-setup.sh --quick 账号 密码               # UA3F 服务模式（默认就是 NFQUEUE）
+#   SKIP_UA3F=1 sh campus-net-setup.sh --quick 账号 密码                     # 这次完全不动 UA3F（先只搞认证时用）
 #
 # 只改 UCI 配置 + 一个 /etc/nftables.d 里的 nft 规则文件，不装任何软件包。
 # /etc/nftables.d/ 在 firewall4 的 keep.d 里，所以刷固件升级后 TTL 规则仍在。
@@ -42,6 +44,8 @@ TTL_FILE="${TTL_FILE:-/etc/nftables.d/10-ttl-fix.nft}"
 SYSFS="${SYSFS:-/sys/class/net}"		# 可覆盖，便于测试
 LOG_TAG="campus-setup"
 CAMPUS_MODE="${CAMPUS_MODE:-}"
+UA3F_MODE="${UA3F_MODE:-}"	# 空=自动（--quick 用最省 CPU 的 NFQUEUE）
+SKIP_UA3F="${SKIP_UA3F:-0}"	# 1=这次完全不碰 UA3F
 
 # --quick 账号 [密码]：一条命令跑完（伪装用推荐默认值 + 用你给的账号做网页认证）
 case "${1:-}" in
@@ -304,6 +308,14 @@ UA_IMPL=""
 [ -z "$UA_IMPL" ] && { [ -x /usr/bin/ua2f ] || [ -n "$(uget ua2f.enabled.enabled)" ]; } && UA_IMPL="ua2f"
 [ -z "$UA_IMPL" ] && [ -n "$(uget ua3f.enabled.enabled)" ] && UA_IMPL="ua3f"
 TTL_BY_NFT=1
+# SKIP_UA3F=1：这次完全不碰 UA3F（认证只发几个 HTTP 请求，跟 UA 改写无关）。
+# 做法是把 UA_IMPL 清空 → 后面 case 落到"没装"分支，也不会去 restart ua3f。
+SKIPPED_UA=0
+if [ "$SKIP_UA3F" = 1 ]; then
+	warn "SKIP_UA3F=1：这次完全不动 UA3F（先把认证做完，再单独调 UA3F）"
+	msg "    TTL 仍由内核 nft 兜底，认证不受影响"
+	UA_IMPL=""; SKIPPED_UA=1
+fi
 
 # --- 2.3 TTL
 # 统一 TTL：UA3F 的 L3 重写和这里的内核 nft 兜底改的是同一个字段，值不一致会互相打架。
@@ -356,7 +368,14 @@ fi
 case "$UA_IMPL" in
 ua3f)
 	CUR_EN="$(uget ua3f.enabled.enabled)"; [ -z "$CUR_EN" ] && CUR_EN=1
-	CUR_MODE="$(uget ua3f.main.server_mode)"; [ -z "$CUR_MODE" ] && CUR_MODE=TPROXY
+	CUR_MODE="$(uget ua3f.main.server_mode)"; [ -z "$CUR_MODE" ] && CUR_MODE=NFQUEUE
+	# TPROXY 会把**所有流量**绕本机代理一遍（loopback 收发各一次），MT7981 上实测 sys 60%+、io 20%+；
+	# NFQUEUE 只把包交给内核队列处理，开销低得多。所以 --quick 默认用 NFQUEUE。
+	if [ "$AUTO" = 1 ] && [ "$SKIP_UA3F" != 1 ]; then
+		[ -n "$UA3F_MODE" ] && NEW_MODE="$UA3F_MODE" || NEW_MODE="NFQUEUE"
+		[ "$CUR_MODE" != "$NEW_MODE" ] && msg "    UA3F 服务模式：$CUR_MODE → $NEW_MODE（$([ "$NEW_MODE" = NFQUEUE ] && echo 'NFQUEUE 省 CPU，TPROXY 会把全部流量绕本机代理' || echo '按 UA3F_MODE 指定'))"
+		CUR_MODE="$NEW_MODE"
+	fi
 	CUR_UA="$(uget ua3f.main.ua)"; [ -z "$CUR_UA" ] && CUR_UA=FFF
 	CUR_TTL="$(uget ua3f.main.l3_rewrite_ttl)"; [ -z "$CUR_TTL" ] && CUR_TTL=0
 	msg "    UA3F 现状：启用=$CUR_EN 服务模式=$CUR_MODE UA=$CUR_UA TTL重写=$CUR_TTL"
@@ -401,7 +420,16 @@ ua3f)
 		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_tcpwin='1' ;; *) run uci set ua3f.main.l3_rewrite_tcpwin='0' ;; esac
 		ask "    阻断 QUIC（l3_rewrite_block_quic，强制回落 TCP 好让改写生效）(y/N)" "$(uget ua3f.main.l3_rewrite_block_quic)"
 		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_block_quic='1' ;; *) run uci set ua3f.main.l3_rewrite_block_quic='0' ;; esac
-		ask "    L3 重写用 eBPF 加速（l3_rewrite_bpf_offload；内核 ≥5.15，省 CPU）(y/N)" "$(uget ua3f.main.l3_rewrite_bpf_offload)"
+		EBPF_DEF="$(uget ua3f.main.l3_rewrite_bpf_offload)"
+		if [ -z "$EBPF_DEF" ]; then
+			_kv="$(uname -r | cut -d. -f1-2)"
+			case "$_kv" in
+				6.*|5.1[5-9]|5.[2-9][0-9]) EBPF_DEF=1 ;;
+				*) EBPF_DEF=0 ;;
+			esac
+			[ "$AUTO" = 1 ] && [ "$EBPF_DEF" = 1 ] && msg "    内核 $_kv 支持 eBPF → L3 重写默认用 eBPF 卸载（省 CPU）"
+		fi
+		ask "    L3 重写用 eBPF 加速（l3_rewrite_bpf_offload；内核 ≥5.15，省 CPU）(y/N)" "$EBPF_DEF"
 		case "$REPLY" in 1|y|Y|yes|是) run uci set ua3f.main.l3_rewrite_bpf_offload='1' ;; *) run uci set ua3f.main.l3_rewrite_bpf_offload='0' ;; esac
 
 		msg "    下面两项是 Desync（对付深层包检测 DPI 的乱序/混淆），不确定就都选 N"
@@ -471,8 +499,12 @@ ua2f)
 	esac
 	;;
 *)
+	if [ "${SKIPPED_UA:-0}" = 1 ]; then
+		msg "    （按 SKIP_UA3F=1 跳过；UA3F 的配置原样不动）"
+	else
 	warn "没装 UA3F / UA2F（/usr/bin/ua3f 不存在）—— 跳过 UA 部分"
 	msg "    想要：把 UA3F 编进固件，或在有依赖的固件上装官方 apk（见 README「附：不想重编固件」）"
+	fi
 	;;
 esac
 

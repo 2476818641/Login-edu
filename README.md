@@ -85,6 +85,17 @@ sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
 > # 或者在跑 --quick 时指定：UA3F_RULES=blacklist sh ... --quick 账号 密码
 > ```
 >
+> ⚠️ **规则表只在 `RULE` 模式下生效**（UA3F 的 `rewrite_mode`）：
+>
+> | 改写模式 | 行为 |
+> |---|---|
+> | `GLOBAL`（官方默认） | **不读规则表**！只放行 5 个硬编码 UA（`MicroMessenger Client`、`Bilibili Freedoooooom/MarkII`、`Valve/Steam HTTP Client 1.0`、`Go-http-client/1.1`、`ByteDancePcdn`），其余全部改成 `ua` —— 加速器/HttpDns 就是这么被改坏的 |
+> | `RULE` | 按 `header_rewrite` 规则表逐条匹配（**正表/反表都需要它**）|
+> | `DIRECT` | 完全不改写 |
+>
+> `--ua3f-rules` 会**连带把 `rewrite_mode` 设对**（whitelist/blacklist → `RULE`；all → `GLOBAL`），
+> 手动在 LuCI 改规则表时记得把 **Rewrite Mode 选成 Rule Based**，否则改了也没用。
+>
 > 规则表就是 UCI 里的一段 JSON（`ua3f.main.header_rewrite`），也能在 LuCI「服务→UA3F」可视化编辑。
 > 验证有没有生效：LuCI 那个页面里的**「请求 Header 实时统计」**，对比"原文 UA / 改写后 UA"两列 ——
 > 正表下只有路由器/命令行类会被改，Steam/加速器的原文与改写后应当**一致**。

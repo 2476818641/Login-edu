@@ -29,7 +29,7 @@
 #   UA3F_MODE=NFQUEUE sh campus-net-setup.sh --quick 账号 密码               # UA3F 服务模式（默认就是 NFQUEUE）
 #   SKIP_UA3F=1 sh campus-net-setup.sh --quick 账号 密码                     # 这次完全不动 UA3F（先只搞认证时用）
 #   UA3F_RULES=whitelist|blacklist|all sh campus-net-setup.sh --quick 账号 密码   # UA 改写范围（默认 whitelist 正表）
-#   sh campus-net-setup.sh --ua3f-rules whitelist                            # 只切规则表（不动网络/认证）
+#   sh campus-net-setup.sh --ua3f-rules whitelist                            # 只切规则表（不动网络/认证；会同时设 rewrite_mode=RULE）
 #
 # 只改 UCI 配置 + 一个 /etc/nftables.d 里的 nft 规则文件，不装任何软件包。
 # /etc/nftables.d/ 在 firewall4 的 keep.d 里，所以刷固件升级后 TTL 规则仍在。
@@ -109,8 +109,14 @@ uget() { uci -q get "$1" 2>/dev/null; }
 #           SRC-IP URL-REGEX FINAL；action 可用：DIRECT REPLACE REPLACE-REGEX DELETE ADD DROP REJECT。
 # 规则自上而下匹配、FINAL 兜底；HEADER-REGEX 是**子串匹配**（Go regexp.MatchString，不用加锚）。
 #
-# 为什么需要规则集：全局改写（FINAL REPLACE）会把 Steam / 游戏加速器 / HttpDns 这类**协议敏感**的 UA
-# 也改成浏览器 UA，导致它们认证失败（真机实测：加速器不可用、Steam 无法下载）。
+# ⚠️ 关键：UA3F 有 rewrite_mode，**规则表只在 RULE 模式生效**：
+#     GLOBAL（官方默认）—— 不读规则表！只放行 5 个硬编码 UA：
+#         MicroMessenger Client / Bilibili Freedoooooom/MarkII /
+#         Valve/Steam HTTP Client 1.0 / Go-http-client/1.1 / ByteDancePcdn
+#         其余**全部**改写成 uci 里的 ua —— 加速器/HttpDns/各类 App 就是这么被改坏的。
+#     RULE   —— 按 header_rewrite 规则表逐条匹配（正表/反表都需要它）。
+#     DIRECT —— 完全不改写。
+#     所以本函数应用规则表时**会同时把 rewrite_mode 设成 RULE**（all 则设回 GLOBAL）。
 UA3F_DEFAULT_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 
 ua3f_target_ua() {	# 用 uci 里已配的 UA；没配或是占位符就用默认
@@ -142,9 +148,16 @@ apply_ua3f_rules() {	# apply_ua3f_rules <whitelist|blacklist|all>
 		return 0
 	fi
 	if [ "$DRY_RUN" = 1 ]; then
+		printf '    [dry-run] uci set ua3f.main.rewrite_mode=%s\n' "$([ "$_set" = all ] && echo GLOBAL || echo RULE)"
 		printf '    [dry-run] uci set ua3f.main.header_rewrite=<%s 规则表 %s 字节>\n' "$_set" "$(printf '%s' "$_json" | wc -c)"
 		return 0
 	fi
+	# 规则表要生效必须切到 RULE 模式（GLOBAL 会忽略规则表）
+	case "$_set" in
+		all) _mode="GLOBAL" ;;
+		*)   _mode="RULE" ;;
+	esac
+	uci set "ua3f.main.rewrite_mode=$_mode" 2>/dev/null || true
 	if ! uci set "ua3f.main.header_rewrite=$_json" 2>/dev/null; then
 		warn "    uci set 失败 —— 去 LuCI「服务→UA3F」手工把规则表替换成下面这份："
 		printf '%s\n' "$_json"
@@ -153,7 +166,8 @@ apply_ua3f_rules() {	# apply_ua3f_rules <whitelist|blacklist|all>
 	uci commit ua3f 2>/dev/null || { warn "    uci commit ua3f 失败"; return 1; }
 	[ -n "$(uci -q get ua3f.main.header_rewrite)" ] || { warn "    规则表没存进去"; return 1; }
 	/etc/init.d/ua3f restart >/dev/null 2>&1
-	msg "    ✅ 已应用 UA3F 规则集：$_set（已重启 UA3F）"
+	[ "$(uci -q get ua3f.main.rewrite_mode)" = "$_mode" ] || warn "    rewrite_mode 没设成 $_mode，规则表可能不生效"
+	msg "    ✅ 已应用 UA3F 规则集：$_set（rewrite_mode=$_mode，已重启 UA3F）"
 	case "$_set" in
 		whitelist) msg "       只有路由器/命令行类 UA 会被改写；Steam / 加速器 / HttpDns 等一律放行" ;;
 		blacklist) msg "       其余全部统一改写，只放行列出的协议敏感流量" ;;
@@ -455,7 +469,8 @@ ua3f)
 	fi
 	CUR_UA="$(uget ua3f.main.ua)"; [ -z "$CUR_UA" ] && CUR_UA=FFF
 	CUR_TTL="$(uget ua3f.main.l3_rewrite_ttl)"; [ -z "$CUR_TTL" ] && CUR_TTL=0
-	msg "    UA3F 现状：启用=$CUR_EN 服务模式=$CUR_MODE UA=$CUR_UA TTL重写=$CUR_TTL"
+	msg "    UA3F 现状：启用=$CUR_EN 服务模式=$CUR_MODE 改写模式=$(uget ua3f.main.rewrite_mode) UA=$CUR_UA TTL重写=$CUR_TTL"
+	[ "$(uget ua3f.main.rewrite_mode)" = GLOBAL ] && msg "      ⚠️ 改写模式是 GLOBAL —— 规则表不生效（只有 5 个硬编码 UA 放行），应用规则集会自动切成 RULE"
 	[ -z "$(uget ua3f.main.header_rewrite)" ] && \
 		warn "      规则表(header_rewrite)是空的 → 装了也不会改 UA，去 LuCI「服务→UA3F」恢复默认规则"
 

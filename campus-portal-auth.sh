@@ -164,6 +164,17 @@ hexify() {
 	return 1
 }
 
+# 取一个 0-255 的随机数。注意：不能用 `hexdump -e '"%u"'` —— 它可能输出带前导零的 "081"，
+# dash/ash 会把它当**八进制**解析而报 "Illegal number: 081"（真机 + 测试都踩过）。
+rand_byte() {
+	_b="$(head -c 1 /dev/urandom 2>/dev/null | hexify 2>/dev/null)"
+	case "$_b" in
+		[0-9a-fA-F][0-9a-fA-F]) printf '%d' "$(( 0x$_b ))"; return 0 ;;
+	esac
+	if [ -n "${RANDOM:-}" ]; then printf '%d' "$(( RANDOM % 256 ))"; return 0; fi
+	printf '%d' "$(( $$ % 256 ))"
+}
+
 raas_encode() {	# raas_encode <明文密码> → 32 位 hex；失败原因写进 RAAS_ERR
 	RAAS_ERR=""
 	if ! command -v openssl >/dev/null 2>&1; then RAAS_ERR="没有 openssl（装 openssl-util）"; return 1; fi
@@ -172,9 +183,8 @@ raas_encode() {	# raas_encode <明文密码> → 32 位 hex；失败原因写进
 	_nonce=''
 	_i=0
 	while [ "$_i" -lt 4 ]; do
-		_r="$(hexdump -v -n 1 -e '"%u"' /dev/urandom 2>/dev/null)"
-		[ -n "$_r" ] || _r="$(printf '%s' "$(date +%N 2>/dev/null)" | sed 's/[^0-9]//g' | cut -c1-3)"
-		[ -n "$_r" ] || _r=$(( ($$ + _i) % 256 ))
+		_r="$(rand_byte)"
+		case "$_r" in ''|*[!0-9]*) _r=0 ;; esac
 		_nonce="$_nonce$(printf '%s' "$RAAS_ALPHA" | cut -c$(( _r % 61 + 1 )))"
 		_i=$((_i + 1))
 	done
@@ -628,7 +638,7 @@ for _path in $(printf '%s' "$API_PATHS" | tr ',' ' '); do
 		if [ "$STEP" = 1 ] && [ "$RET" = 4 ]; then
 			say "账号或密码不正确（ret=4 msg=$MSG）"
 			say "  → 密码没输错的话，用 --hash-test 核对密码处理方式；或换 --setup 重新填一次"
-			log "auth rejected at $(_path): ret=4 (bad credentials)"
+			log "auth rejected at ${_path}: ret=4 (bad credentials)"
 			FAILED=1
 			break
 		fi

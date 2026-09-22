@@ -28,6 +28,8 @@
 #   CAMPUS_MAC=AA:BB:CC:DD:EE:FF sh campus-net-setup.sh --quick 账号 密码   # 连 MAC 也不问
 #   UA3F_MODE=NFQUEUE sh campus-net-setup.sh --quick 账号 密码               # UA3F 服务模式（默认就是 NFQUEUE）
 #   SKIP_UA3F=1 sh campus-net-setup.sh --quick 账号 密码                     # 这次完全不动 UA3F（先只搞认证时用）
+#   UA3F_RULES=whitelist|blacklist|all sh campus-net-setup.sh --quick 账号 密码   # UA 改写范围（默认 whitelist 正表）
+#   sh campus-net-setup.sh --ua3f-rules whitelist                            # 只切规则表（不动网络/认证）
 #
 # 只改 UCI 配置 + 一个 /etc/nftables.d 里的 nft 规则文件，不装任何软件包。
 # /etc/nftables.d/ 在 firewall4 的 keep.d 里，所以刷固件升级后 TTL 规则仍在。
@@ -44,8 +46,11 @@ TTL_FILE="${TTL_FILE:-/etc/nftables.d/10-ttl-fix.nft}"
 SYSFS="${SYSFS:-/sys/class/net}"		# 可覆盖，便于测试
 LOG_TAG="campus-setup"
 CAMPUS_MODE="${CAMPUS_MODE:-}"
-UA3F_MODE="${UA3F_MODE:-}"	# 空=自动（--quick 用最省 CPU 的 NFQUEUE）
+UA3F_MODE="${UA3F_MODE:-}"	# 空=自动（--quick 默认 REDIRECT，实测可用）
+UA3F_RULES="${UA3F_RULES:-}"	# 空=自动（--quick 默认 whitelist：只改路由器/命令行类 UA）
 SKIP_UA3F="${SKIP_UA3F:-0}"	# 1=这次完全不碰 UA3F
+# 说明：UA3F_MODE=REDIRECT（实测可用）/ NFQUEUE（省 CPU，未实测）/ TPROXY（实测不改写）
+#       UA3F_RULES=whitelist（正表，推荐）/ blacklist（反表，保留全局统一）/ all（全部改写）
 
 # --quick 账号 [密码]：一条命令跑完（伪装用推荐默认值 + 用你给的账号做网页认证）
 case "${1:-}" in
@@ -97,6 +102,75 @@ ask_always() {	# 与 ask 相同，但 **--quick 模式下也会问**（没终端
 	return 0
 }
 uget() { uci -q get "$1" 2>/dev/null; }
+
+# ---------------------------------------------------------------- UA3F 规则表（header_rewrite）
+# UA3F 的规则表是 UCI 里的一段 JSON（LuCI「服务→UA3F」可视化编辑）。字段：type/action/match_*/rewrite_*；
+# type 可用：HEADER-KEYWORD HEADER-REGEX DOMAIN DOMAIN-KEYWORD DOMAIN-SUFFIX IP-CIDR DEST-PORT
+#           SRC-IP URL-REGEX FINAL；action 可用：DIRECT REPLACE REPLACE-REGEX DELETE ADD DROP REJECT。
+# 规则自上而下匹配、FINAL 兜底；HEADER-REGEX 是**子串匹配**（Go regexp.MatchString，不用加锚）。
+#
+# 为什么需要规则集：全局改写（FINAL REPLACE）会把 Steam / 游戏加速器 / HttpDns 这类**协议敏感**的 UA
+# 也改成浏览器 UA，导致它们认证失败（真机实测：加速器不可用、Steam 无法下载）。
+UA3F_DEFAULT_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
+ua3f_target_ua() {	# 用 uci 里已配的 UA；没配或是占位符就用默认
+	_u="$(uget ua3f.main.ua)"
+	case "$_u" in ''|keep|KEEP|FFF|fff) printf '%s' "$UA3F_DEFAULT_UA" ;; *) printf '%s' "$_u" ;; esac
+}
+
+ua3f_rules_json() {	# ua3f_rules_json <whitelist|blacklist|all> <UA>
+	case "$1" in
+	whitelist)
+		printf '[{"enabled":true,"type":"HEADER-REGEX","match_header":"User-Agent","match_value":"(uclient|Wget|wget|curl|libcurl|Go-http-client|python-requests|Python-urllib|aria2|Transmission|BusyBox|OpenWrt|LuCI)","action":"REPLACE","rewrite_header":"User-Agent","rewrite_value":"%s","description":"正表：路由器/命令行 UA 统一成 PC"},{"enabled":true,"type":"FINAL","action":"DIRECT","description":"其余一律不改写（Steam/加速器/HttpDns 等协议敏感流量靠这条放行）"}]' "$2"
+		;;
+	blacklist)
+		printf '[{"enabled":true,"type":"DOMAIN-KEYWORD","match_value":"steam","action":"DIRECT","description":"Steam 商店/CDN"},{"enabled":true,"type":"HEADER-KEYWORD","match_header":"User-Agent","match_value":"Valve/Steam","action":"DIRECT","description":"Steam 客户端"},{"enabled":true,"type":"DOMAIN-KEYWORD","match_value":"allawntech","action":"DIRECT","description":"迅游加速器"},{"enabled":true,"type":"HEADER-KEYWORD","match_header":"User-Agent","match_value":"KCG-PD","action":"DIRECT","description":"加速器"},{"enabled":true,"type":"HEADER-KEYWORD","match_header":"User-Agent","match_value":"NxSdk","action":"DIRECT","description":"加速器 SDK"},{"enabled":true,"type":"HEADER-KEYWORD","match_header":"User-Agent","match_value":"HttpDns","action":"DIRECT","description":"App 内 HTTPDNS（改了会解析失败）"},{"enabled":true,"type":"HEADER-KEYWORD","match_header":"User-Agent","match_value":"Microsoft-CryptoAPI","action":"DIRECT","description":"Windows 证书/更新"},{"enabled":true,"type":"HEADER-KEYWORD","match_header":"User-Agent","match_value":"Microsoft NCSI","action":"DIRECT","description":"Windows 联网探测"},{"enabled":true,"type":"FINAL","action":"REPLACE","rewrite_header":"User-Agent","rewrite_value":"%s","description":"默认：统一改写"}]' "$2"
+		;;
+	all)
+		printf '[{"enabled":true,"type":"FINAL","action":"REPLACE","rewrite_header":"User-Agent","rewrite_value":"%s","description":"全部改写（兼容性最差）"}]' "$2"
+		;;
+	*) return 2 ;;
+	esac
+}
+
+apply_ua3f_rules() {	# apply_ua3f_rules <whitelist|blacklist|all>
+	_set="$1"
+	_json="$(ua3f_rules_json "$_set" "$(ua3f_target_ua)")" || { warn "未知规则集：$_set（可选 whitelist / blacklist / all）"; return 2; }
+	if ! command -v uci >/dev/null 2>&1; then
+		msg "    （不是路由器：规则表内容如下，可粘进 LuCI「服务→UA3F」的规则编辑器）"
+		printf '%s\n' "$_json"
+		return 0
+	fi
+	if [ "$DRY_RUN" = 1 ]; then
+		printf '    [dry-run] uci set ua3f.main.header_rewrite=<%s 规则表 %s 字节>\n' "$_set" "$(printf '%s' "$_json" | wc -c)"
+		return 0
+	fi
+	if ! uci set "ua3f.main.header_rewrite=$_json" 2>/dev/null; then
+		warn "    uci set 失败 —— 去 LuCI「服务→UA3F」手工把规则表替换成下面这份："
+		printf '%s\n' "$_json"
+		return 1
+	fi
+	uci commit ua3f 2>/dev/null || { warn "    uci commit ua3f 失败"; return 1; }
+	[ -n "$(uci -q get ua3f.main.header_rewrite)" ] || { warn "    规则表没存进去"; return 1; }
+	/etc/init.d/ua3f restart >/dev/null 2>&1
+	msg "    ✅ 已应用 UA3F 规则集：$_set（已重启 UA3F）"
+	case "$_set" in
+		whitelist) msg "       只有路由器/命令行类 UA 会被改写；Steam / 加速器 / HttpDns 等一律放行" ;;
+		blacklist) msg "       其余全部统一改写，只放行列出的协议敏感流量" ;;
+		all)       msg "       全部改写（Steam / 加速器 可能受影响）" ;;
+	esac
+	msg "       验证：LuCI「服务→UA3F」→『请求 Header 实时统计』，对比 原文 UA / 改写后 UA"
+	return 0
+}
+
+# --ua3f-rules：只切规则表（放在函数定义之后，否则调用不到）
+case "${1:-}" in
+--ua3f-rules)
+	[ "$(id -u)" = 0 ] || { echo "请用 root 运行"; exit 1; }
+	apply_ua3f_rules "${2:-whitelist}" || exit 1
+	exit 0
+	;;
+esac
 
 [ "$(id -u)" = 0 ] || die "请用 root 运行（需要改网络与防火墙配置）"
 command -v uci >/dev/null 2>&1 || die "找不到 uci —— 这个脚本要在 OpenWrt 路由器上运行"
@@ -459,6 +533,8 @@ ua3f)
 		run uci set "ua3f.main.log_level=$REPLY"
 		msg "    HTTPS MitM 没动（只给指定域名解密才需要，要先配 CA；在 LuCI「服务→UA3F」里做）"
 		run uci set ua3f.enabled.enabled='1'
+		# UA 改写范围：默认"正表"——只改路由器/命令行类 UA，放行 Steam/加速器/HttpDns 等协议敏感流量
+		apply_ua3f_rules "${UA3F_RULES:-whitelist}"
 		;;
 	*)
 		UA_ENABLED=0

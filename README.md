@@ -10,7 +10,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| **`campus-net-setup.sh`** | **入口脚本**：先做网络伪装（MAC 克隆 / MTU / TTL / UA3F），配完测外网；不通就**自动接着做认证**，成功后装好自动登录 |
+| **`campus-net-setup.sh`** | **入口脚本**：先做网络伪装（MAC 克隆 / MTU / TTL / UA-Mask 的 UA 改写），配完测外网；不通就**自动接着做认证**，成功后装好自动登录 |
 | **`campus-portal-auth.sh`** | **认证脚本**：网页认证实现（三步 API + AES 加密的 `pass`）。入口脚本会自动下载它；也可单独用（`--quick` / `--status` / `--setup`） |
 | **`burp-xml-summary.py`** | **解析 XML 脚本**：把 Burp 导出的几十 MB XML 压成几 KB 小抄（换学校抓包时才用） |
 | **`README.md`** | 介绍流程（本文） |
@@ -47,65 +47,76 @@ sh /tmp/campus-net-setup.sh --quick 你的账号 你的密码
 > `/etc/campus-portal-auth.sh`），找不到才尝试下载（每个源最多 8 秒，失败不纠缠）。
 > 因为**认证前本来就没网**，建议一开始就把两个文件一起传到路由器同一目录，最省事。
 
-> **UA3F 服务模式（以真机实测为准）**：`--quick` 默认设成 **REDIRECT**。
+> ### UA 改写用 UA-Mask（当前方案）
 >
-> | 模式 | 本机实测 | 说明 |
+> UA-Mask 是**只做 UA 改写**的透明代理：只劫持 TCP，默认就绕过 22/443，而且能把「确认不是 HTTP」
+> 的目标**自动卸载进 nftables 集合** —— 命中后那些流量根本不进用户态代理。这一条就是解决
+> "游戏加速器/Steam 被代理转坏"的关键：隧道类流量（非 80/443 的高位端口 TCP）学几次后永久绕过，
+> 而且按 `目标IP.端口` 记录，**节点 IP 变了会自动重新学**，不需要你维护 IP 白名单。
+>
+> 脚本的 `--quick` 一键做的就是下面这一整套（不用你手点 LuCI）：
+>
+> | 项 | 值 | 为什么 |
 > |---|---|---|
-> | **REDIRECT** | ✅ **可行**（UA 确实被改写） | 脚本默认 |
-> | TPROXY | ❌ **不行**（UA 没被改写）且最贵 | 全部流量绕本机代理一遍（loopback 收发各一次），实测 `sys 60%+ / io 20%+`、负载 4+ |
-> | NFQUEUE | 未实测 | 开销最低，想省 CPU 可以自己试：`UA3F_MODE=NFQUEUE` |
+> | `ua` | 常见 Windows Chrome UA | 所有设备（手机也是）统一成"同一台 PC" |
+> | `match_mode` | `regex`（正表，默认）/ `all`（全量） | 正表只统一「设备类」UA，其余原样放行，兼容性最好 |
+> | `ua_regex` | `(iPhone\|iPad\|Android\|Macintosh\|Windows\|Linux\|Apple\|Mac OS X\|Mobile)` | 命中才改写，未命中放行 |
+> | `Firewall_ua_whitelist` | `QeeYouAcceler,Valve/Steam,HttpDns,Microsoft-CryptoAPI,Microsoft NCSI` | 这些 UA **不改写**，并且**命中即把该目标立刻卸载出代理**（24h） |
+> | `Firewall_drop_on_match` | `0` | **必须是 0**，填 1 会直接掐断匹配上的连接 |
+> | `enable_firewall_set` + `Firewall_ua_bypass` | `1` + `1` | 流量卸载总开关 + 绕过非 HTTP 流量（固件默认已开） |
+> | `firewall_nonhttp_threshold / decision_delay / timeout` | `1` / `10`（秒）/ `86400` | 决策器默认"5 次观测 + 60s 延迟 + 8h"是为了防误判泄露；压到最小让隧道尽快被卸载 |
+> | `bypass_ports` | `22 443` | 443 是 TLS，本来也看不到 UA |
+> | `operating_profile` | `Medium` | 256MB 机器：Low=200 并发 / Medium=500 / High=1000 |
 >
-> 换模式：`UA3F_MODE=TPROXY sh ... --quick ...`（或直接 `uci set ua3f.main.server_mode='REDIRECT'`）。
-> 这次完全不想动 UA3F：`SKIP_UA3F=1 sh ... --quick ...`。
-> 内核 ≥5.15 时会默认打开 `l3_rewrite_bpf_offload`（eBPF 卸载）省一层 CPU。
+> ⚠️ **三个"名单"的优先级**（源码 `internal/rewrite/engine.go`，从高到低）：
+> `Firewall_ua_whitelist`（不改写 **且卸载**）→ `whitelist`（只是不改写）→
+> `match_mode`（`all` 全改 / `regex` 命中才改 / `keywords` 含关键词才改）。
+> **别把 `MicroMessenger` / `Bilibili` 放进 `Firewall_ua_whitelist`** —— 它优先级高于正则，而手机微信/
+> 哔哩哔哩的 UA 里带 `Android`/`iPhone`，一旦被放过，"Windows Chrome UA + Android UA"同时出现，
+> **反而暴露多设备**。所以脚本把 `whitelist`（第二个名单）留空。
 >
-> 脚本跑完会**自动自检 UA 是否真被改写**（访问 ua-check 站点找 UA3F 标记）；没看到会提示换模式 —— 这条正是发现
-> "TPROXY 不生效"的方式，别再靠猜。
->
-> ### UA 改写范围：默认用"正表"（重要，影响 Steam / 加速器）
->
-> **全局改写（FINAL REPLACE）会把 Steam、游戏加速器、App 内 HttpDns 这类协议敏感流量的 UA 也改成浏览器 UA**，
-> 结果是：加速器连不上、Steam 无法下载 —— 真机实测就是这个原因（UA3F 统计表里能看到
-> `Valve/Steam HTTP Client 1.0`、`HttpDns`、`allawntech`（迅游）、`KCG-PD`、`Microsoft-CryptoAPI` 等都被改写成了 Chrome UA）。
->
-> 奇游加速器同理：它的 UA 是 `PC/Windows/windows10.0.22621.4249x64/10/QeeYouAcceler-PC/7.2.0/E8F408BCAC3C`，
-> 跑在 `report.qiyou.cn` / `nsnode.qiyou.cn` / `qy-game-policy-conf.oss-cn-hangzhou.aliyuncs.com` 上，
-> 被改写成 Chrome/Edg UA 后就废了。**正表下它天然不受影响**（不在改写名单里），反表已按 `QeeYouAcceler` + 域名 `qiyou` 放行。
->
-> 所以脚本默认用**正表**：只把"路由器/命令行"这类会暴露共享的 UA 改写成 PC UA，其余一律放行。
->
-> | 规则集 | 行为 | 适用 |
-> |---|---|---|
-> | **`whitelist`（正表，默认）** | 只改写 `uclient/Wget/curl/Go-http-client/BusyBox/OpenWrt/aria2…` 这类 UA；`FINAL=DIRECT` 放行其余 | **推荐**：兼容性最好，Steam/加速器/HttpDns 都不受影响 |
-> | `blacklist`（反表） | 默认统一改写，仅对列出的协议敏感流量放行（官方那 5 个 + Steam / **奇游 qiyou** / 迅游 / 加速器 SDK / HttpDns / Windows 证书与联网探测） | 学校确实会按"UA 多样性"判断共享时用 |
-> | `all`（全局） | 全部改写（UA3F 原始默认） | 兼容性最差，不推荐 |
->
-> 切换方式（随时可换，不碰网络和认证）：
+> 切换范围（随时可换，不碰网络和认证）：
 >
 > ```sh
-> sh campus-net-setup.sh --ua3f-rules whitelist     # 正表（默认）
-> sh campus-net-setup.sh --ua3f-rules blacklist     # 反表
-> sh campus-net-setup.sh --ua3f-rules all           # 全局
-> # 或者在跑 --quick 时指定：UA3F_RULES=blacklist sh ... --quick 账号 密码
+> sh campus-net-setup.sh --ua-mode regex     # 正表（默认，推荐）
+> sh campus-net-setup.sh --ua-mode all       # 全量改写（最统一，兼容性最差）
+> UA_MODE=all sh campus-net-setup.sh --quick 账号 密码      # --quick 时指定
+> UA_STR='Mozilla/5.0 ...' sh ... --quick 账号 密码          # 换伪装 UA（记得 TTL 要自洽）
+> SKIP_UA=1 sh ... --quick 账号 密码                         # 这次完全不动 UA 改写
 > ```
 >
-> ⚠️ **规则表只在 `RULE` 模式下生效**（UA3F 的 `rewrite_mode`）：
+> 旧写法 `--ua3f-rules whitelist|blacklist|all` 仍然能用（会提示改名，`whitelist→regex`、`blacklist/all→all`）。
 >
-> | 改写模式 | 行为 |
-> |---|---|
-> | `GLOBAL`（官方默认） | **不读规则表**！只放行 5 个硬编码 UA（`MicroMessenger Client`、`Bilibili Freedoooooom/MarkII`、`Valve/Steam HTTP Client 1.0`、`Go-http-client/1.1`、`ByteDancePcdn`），其余全部改成 `ua` —— 加速器/HttpDns 就是这么被改坏的 |
-> | `RULE` | 按 `header_rewrite` 规则表逐条匹配（**正表/反表都需要它**）|
-> | `DIRECT` | 完全不改写 |
+> ### TTL：UA-Mask 没有这个功能，由内核 nft 规则负责
 >
-> `--ua3f-rules` 会**连带把 `rewrite_mode` 设对**（whitelist/blacklist → `RULE`；all → `GLOBAL`），
-> 手动在 LuCI 改规则表时记得把 **Rewrite Mode 选成 Rule Based**，否则改了也没用。
+> UA-Mask 不做 L3（没有 TTL/IPID/删 TCP 时间戳/阻断 QUIC/Desync —— 那些是旧方案 UA3F 的能力，
+> 而它们实测会打死加速器与 QUIC 流量）。所以 TTL 由脚本写的 `/etc/nftables.d/10-ttl-fix.nft` 负责，
+> 默认值与 UA 人设**自洽**：UA 说 Windows → `128`，说 Android/Linux/macOS → `64`
+> （UA 与 TTL 自相矛盾正是 DPI 会抓的点）。改：`TTL_VALUE=128 sh ... --quick 账号 密码`。
 >
-> 规则表就是 UCI 里的一段 JSON（`ua3f.main.header_rewrite`），也能在 LuCI「服务→UA3F」可视化编辑。
-> 验证有没有生效：LuCI 那个页面里的**「请求 Header 实时统计」**，对比"原文 UA / 改写后 UA"两列 ——
-> 正表下只有路由器/命令行类会被改，Steam/奇游/迅游等加速器的原文与改写后应当**一致**（奇游看 `QeeYouAcceler` 那一行）。
+> ### 自检
 >
-> 另外注意 `top` 里 UA3F 的 `VSZ 1300m / %VSZ 566%` 是 **Go 预留的虚拟地址空间，不是真实占用**；
-> 真实内存看 `cat /proc/$(pidof ua3f)/status | grep VmRSS`（通常几十 MB，256MB 的路由器够用）。
+> 脚本跑完会检查：服务在跑 / 核心配置 `/var/run/UAmask/config.json` 生成正确 / fw4 里存在
+> 绕过集合 `UAmask_bypass_set`。**真实效果要在电脑或手机上打开 <http://ua-check.stagoh.com/> 看** ——
+> 路由器自己 curl 是不准的（UA-Mask 只处理 LAN 侧进来的流量），而且"grep 页面里有没有某字样"
+> 那种判法是假阳性（那个站本身就叫 UA3F）。
+>
+> 加速器还是不通时，先看它有没有被卸载出去：
+>
+> ```sh
+> nft list set inet fw4 UAmask_bypass_set      # 应该有 节点IP.端口
+> ```
+>
+> 想跳过"学习期"，把端口静态加进放行列表：
+> `uci add_list UAmask.main.bypass_ports='端口号'; uci commit UAmask; /etc/init.d/UAmask restart`
+>
+> ### 旧方案（UA3F / UA2F）仍兼容
+>
+> 老固件里装的是 UA3F 时，脚本会自动走 legacy 路径（规则表那套逻辑照旧）；**同时装了两套**时，
+> 脚本会**自动停用 UA3F 并 `nft delete table inet UA3F`** —— 必须删表：UA3F 的 `stop` 不清 nft，
+> 残留的 `tcp dport != {22} redirect to :1080` 会把除 22 外的所有 TCP 吸进没人监听的端口，
+> 表现是"电脑没网但 ping 正常"。
+>
 
 想连这一步也不问（脚本化/远程执行时方便）：
 
@@ -119,7 +130,7 @@ CAMPUS_MAC=AA:BB:CC:DD:EE:FF sh /tmp/campus-net-setup.sh --quick 你的账号 �
 
 ```
 1/4 选择接入方式      → 网页认证（--quick 自动选）
-2/4 网络伪装          → MAC（默认不改）→ MTU → TTL（UA3F 优先，内核 nft 兜底）→ UA3F（UA / L3 重写 / Desync）
+2/4 网络伪装          → MAC（默认不改）→ MTU → TTL（内核 nft 规则，128/64 跟 UA 人设走）→ UA 改写（UA-Mask 一键配好）
 3/4 应用配置          → uci commit → network restart → fw4 reload
 4/4 等 20 秒测外网    → 通了：完成（顺手存账号 + 装自动登录）
                        └ 不通：自动接着做网页认证，成功后装 hotplug + cron
@@ -146,9 +157,9 @@ sh /tmp/campus-net-setup.sh                              # 交互式：自己挑
 
 | 检测手段 | 路由器上怎么对付 | 落在哪 |
 |---|---|---|
-| **User-Agent**（判断是不是路由器共享） | UA3F 统一改写 UA（老固件的 UA2F 也兼容） | 入口脚本第 2 步的 UA 段 |
-| **TTL / IPID / TCP 指纹** | ① UA3F 的 L3 重写（TTL / IPID / TCP 时间戳 / 初始窗口 / QUIC 阻断）② 内核 nft 规则兜底（全流量、零开销） | 同上；nft 规则在 `/etc/nftables.d/10-ttl-fix.nft` |
-| **深层包检测 DPI** | UA3F 的 Desync（分片乱序 / 混淆注入） | 同上 |
+| **User-Agent**（判断是不是路由器共享） | UA-Mask 把各设备的 UA 统一成一台 PC（只改明文 HTTP） | 入口脚本第 2 步的 UA 段 |
+| **TTL**（路由器共享的包每过一跳 -1） | 内核 nft 规则（**全流量含 ICMP/UDP**，零开销；UA-Mask 本身没有 TTL 功能），规则在 `/etc/nftables.d/10-ttl-fix.nft` | 入口脚本第 2 步 |
+| **深层包检测 DPI** | 不启用（Desync/乱序注入实测会把加速器隧道与 QUIC 打坏，得不偿失） | — |
 | **MAC 绑定** | 把已知设备的 MAC 克隆到 WAN 侧（有线上联写 network，无线上联写 wireless） | 同上 |
 | **网页认证（portal）** | 定时 POST 账号密码到认证接口（**有线、WiFi 上联都一样要**） | `campus-portal-auth.sh` |
 | **PPPoE 拨号** | netifd 配 pppoe | 入口脚本方式 1 |
@@ -176,7 +187,7 @@ sh /tmp/campus-net-setup.sh                # 正式跑
 | 选 `3` 之后的认证方式 | **WiFi 上联一样要认证**：`1` 网页认证（默认）／`2` PPPoE／`3` 不用认证（家里测试） |
 | 要克隆的 MAC | 回车=不改；`auto`=取 `/tmp/dhcp.leases` 第一台设备；或填 `AA:BB:CC:DD:EE:FF` |
 | MTU | PPPoE 默认 1492，网页认证 1500，无线上联默认 `keep`（由 AP 决定） |
-| UA（UA3F，自动识别） | 自动判断固件里装的是 **UA3F**（新，推荐，带 L3 重写）还是 **UA2F**（老固件）。UA3F 会问：启用 / **服务模式**（`NFQUEUE` 最省，`TPROXY` 功能全）/ **UA 串**（`keep`、`win`=常见 Chrome UA、或直接粘贴）/ **L3 重写**：TTL(=64)、IPID、删 TCP Timestamp、TCP 初始窗口、阻断 QUIC |
+| UA 改写（自动识别工具） | 固件里是 **UAmask**（当前方案）就一键配好整套（UA 串 / 匹配规则 / 放行名单 / 流量卸载调优），并**自动停掉旧方案残留**；只有 **ua3f**（旧固件）才走 legacy 规则表那套。会问：启用 / **匹配规则**（`regex` 正表 或 `all` 全量）/ **UA 串**（默认常见 Chrome UA）/ **放行名单** / 是否把非 HTTP 卸载调成快速生效 |
 
 它改了什么（都可回滚）：
 
@@ -185,8 +196,8 @@ sh /tmp/campus-net-setup.sh                # 正式跑
 | MAC 克隆 | `config device` 段（与 LuCI「网络→接口→设备」一致） | LuCI 删掉 MAC 字段 |
 | MTU / MRU | `network.<iface>.mtu` / `.mru` | `uci delete ...` |
 | 接入方式 | `network.<iface>.proto`（pppoe + 账号密码 / dhcp） | 改回 `dhcp` |
-| **TTL** | `/etc/nftables.d/10-ttl-fix.nft`（**除 LAN 网桥外所有出口**改回 64） | `rm` 该文件 + `fw4 reload` |
-| UA | `ua3f.*`（启用/服务模式/UA 串/L3 重写开关）；老固件才是 `ua2f.*` | LuCI「服务→UA3F」（老固件「网络→UA2F」） |
+| **TTL** | `/etc/nftables.d/10-ttl-fix.nft`（**除 LAN 网桥外所有出口**统一成 128 或 64，按 UA 人设） | `rm` 该文件 + `fw4 reload` |
+| UA 改写 | `UAmask.*`（启用/UA 串/匹配规则/放行名单/流量卸载）；旧固件是 `ua3f.*`、更老是 `ua2f.*` | LuCI「服务 → UA MASK」（旧固件「服务→UA3F」） |
 
 > `/etc/nftables.d/` 在 firewall4 的 keep.d 里，**刷固件升级后 TTL 规则仍在**。
 > 规则用"排除 LAN 网桥"而不是写死设备名，所以网线 / PPPoE / 无线 STA 都自动覆盖。
@@ -198,47 +209,40 @@ sh /tmp/campus-net-setup.sh                # 正式跑
 - **没通 + 网页认证（有线上联和无线都一样）** → **自动接着做认证**（入口脚本会先把认证脚本下载好），
   成功打印「认证完成 ✅（网络伪装 + 网页认证 都已生效）」
 
-### 附：UA3F 选项对应表（进阶参考）
+### 附：UA 改写选项对应表（进阶参考）
 
-UA3F 优先 —— 它有 UA2F 完全没有的 L3 重写与 Desync，脚本会**自动检测并优先用 UA3F**：
+现在用 **UA-Mask**（只做 UA 改写）。脚本自动识别工具：UAmask → 一键配好；旧固件的 ua3f → 走 legacy：
 
 | 校园网检测项 | 谁来做 | 具体选项 / 位置 |
 |---|---|---|
-| **User-Agent**（判断是不是路由器共享） | **UA3F** | `ua3f.main.ua`（替换串）+ `ua3f.main.header_rewrite`（规则表，LuCI「服务→UA3F」里可视化编辑；默认对微信/B站/Steam 放行） |
-| **TTL**（共享的包过一跳 -1） | **UA3F** | `ua3f.main.l3_rewrite_ttl=1` + `l3_rewrite_ttl_value=64`；另可选内核 nft 兜底（全流量含 ICMP/UDP，脚本会问） |
-| **IPID**（部分 Dr.COM 会查） | **UA3F** | `ua3f.main.l3_rewrite_ipid=1` |
-| **TCP Timestamp**（指纹特征） | **UA3F** | `ua3f.main.l3_rewrite_tcpts=1`（删掉该选项） |
-| **TCP 初始窗口**（指纹特征） | **UA3F** | `ua3f.main.l3_rewrite_tcpwin=1` |
-| **QUIC 绕过**（走 UDP 443 躲开改写） | **UA3F** | `ua3f.main.l3_rewrite_block_quic=1`（强制回落 TCP） |
-| **深层包检测 DPI** | **UA3F** | `desync_reorder`（分片乱序，+`_bytes`/`_packets`）、`desync_inject`（混淆注入，+`_ttl`） |
-| **HTTPS 里的 UA**（需要解密才能改） | **UA3F** | HTTPS MitM：`mitm_enabled` + CA（客户端要信任该 CA，仅对指定域名生效） |
-| 改写性能（省 CPU） | **UA3F** | `l3_rewrite_bpf_offload=1`（eBPF，要求内核 ≥5.15） |
+| **User-Agent**（判断是不是路由器共享） | **UA-Mask** | `UAmask.main.ua`（伪装串）+ `match_mode`（`regex` 正表 / `all` 全量）+ `ua_regex`；LuCI「服务 → UA MASK」 |
+| **协议敏感流量**（加速器 / Steam / App 内 HttpDns） | **UA-Mask** | `Firewall_ua_whitelist`（不改写**且命中即卸载出代理**）+ `enable_firewall_set=1` + `Firewall_ua_bypass=1`（非 HTTP 目标自动卸载到 nft 集合） |
+| **TTL**（共享的包过一跳 -1） | 内核 nft 规则 | `/etc/nftables.d/10-ttl-fix.nft`；值跟 UA 人设走（Windows→128 / Android·Linux·macOS→64） |
+| **IPID / TCP Timestamp / TCP 初始窗口 / QUIC 阻断** | 不启用 | 这些是旧方案 UA3F 的 L3 能力；"阻断 QUIC"会丢光 UDP 443，把加速器/语音/QUIC 视频全打死 |
+| **深层包检测 DPI** | 不启用 | UA3F 的 `desync_*` 实测会把加速器隧道搅碎 |
+| **HTTPS 里的 UA** | 改不了（也不需要） | 443 是 TLS，明文 UA 只存在于 HTTP，UA-Mask 默认就绕过 443 |
 | **MAC 绑定** | netifd（脚本配置） | `config device` → `macaddr`；无线上联写在 `wireless` 的 `wifi-iface` |
 | **MTU** | netifd（脚本配置） | `network.<iface>.mtu` / `.mru` |
 | **网页认证（portal）** | `campus-portal-auth.sh` | POST 账号密码到认证接口（按抓包生成） |
 | **PPPoE 拨号** | netifd（脚本配置） | `network.<iface>.proto=pppoe` + 账号密码 |
 
-服务模式选择：`NFQUEUE`（老 UA2F 那条路，内核队列，开销最低）或 `TPROXY`（完整代理，功能全但吃 CPU）。
-不确定就先用 `NFQUEUE`。
+### 附：不想重编固件？先手动装 UA-Mask 也能用
 
-### 附：不想重编固件？先手动装 UA3F 也能用
-
-UA3F 官方发布页提供了各架构的 `apk` / `ipk`（我们的目标 `aarch64_cortex-a53` 就有）。**依赖满足时**直接装即可：
+本仓库固件已内置 UA-Mask；老固件想先用起来，可以自己编译一个包再装（ImmortalWrt 25.12 是 **apk**，
+`make package/UA-Mask/compile` 编出来的 `uamask-*.apk` 直接装）：
 
 ```sh
-# 依赖（本仓库固件全部自带；换别的固件请先确认这些都在）
-#   iptables-nft / iptables-mod-{tproxy,extra,ipopt,nfqueue,conntrack-extra}
-#   ipset / luci-compat / kmod-nf-conntrack-netlink
-apk add /tmp/ua3f-3.6.0-r1-aarch64_cortex-a53.apk     # 老固件用 opkg install ua3f_*.ipk
-uci set ua3f.enabled.enabled=1
-uci set ua3f.main.server_mode=NFQUEUE     # 先走省 CPU 的那条路
-uci commit ua3f && /etc/init.d/ua3f restart
+# 装之前必须先把旧方案停干净 —— 漏了这步会"电脑没网但 ping 正常"
+uci set ua3f.enabled.enabled='0'; uci commit ua3f; /etc/init.d/ua3f stop
+nft delete table inet UA3F
+apk add --allow-untrusted /tmp/uamask-0.4.3-r1.apk
+sh campus-net-setup.sh --ua-mode regex      # 一键配好 UA / 放行名单 / 流量卸载
 ```
 
 两条注意：
 
-- **这样装出来的 UA3F 在 overlay 里，sysupgrade 升级固件后会丢**，升级完要重装（编进固件的版本没这个问题）。
-- 依赖里的 `kmod-nf-conntrack-netlink` 是**内核模块**：自编译固件如果没选它，官方仓库的 kmod 装不上（vermagic 不匹配），这时只能重编固件把它带进去。
+- **装在 overlay 里的包，sysupgrade 升级固件后会丢**，升级完要重装（编进固件的版本没这个问题）。
+- UA-Mask 的 LuCI 页面是 Lua CBI，需要固件里有 `luci-compat`（本仓库固件自带）。
 
 ### 第 2 步：网页认证脚本（入口脚本会自动下载，通常不用手动装）
 
@@ -381,8 +385,8 @@ uci commit wireless; uci commit network; wifi reload; /etc/init.d/network restar
 | 主脚本跑完不通（网页认证） | 正常，认证不在主脚本里做 —— 去做第 2 步（抓包生成认证脚本） |
 | 认证脚本跑了但还不通 | ① 字段名/成功标志与抓包不一致 ② 需要先 GET 拿 cookie/token ③ 认证页在内网、被 UA2F 改了 UA → `uci set ua2f.firewall.handle_intranet=0; uci commit ua2f; /etc/init.d/ua2f restart` ④ 账号已在别处登录 |
 | TTL 改了还被检测 | `nft list chain inet fw4 ttl_fix` 看规则在不在；若你的 WAN 也是网桥，把它从规则排除列表里去掉 |
-| UA3F 开着但 UA 没变 | ① `uci get ua3f.enabled.enabled` 要为 1 ② `ua3f.main.header_rewrite` 规则表别是空的（空的就不会改）③ 默认规则对微信/B站/Steam 是放行的。浏览器打开 <http://ua-check.stagoh.com/> 验证（该站默认会显示 `UA3F`）|
-| UA2F 与 UA3F | UA2F 只做 UA 改写（NFQUEUE）；UA3F 是它的超集（多 L3 重写 + Desync + 可选 MitM）。**别同时开**，脚本会自动优先识别 UA3F |
+| UA-Mask 开着但 UA 没变 | ① `uci get UAmask.enabled.enabled` 要为 1 ② UA 没命中匹配规则（`match_mode=regex` 下不匹配就原样放行，这是设计行为）③ 目标端口在 `bypass_ports` 里。真实效果要用**电脑/手机**打开 <http://ua-check.stagoh.com/> 看（路由器自己 curl 不准）|
+| 加速器能连上但延迟测不出来 / 报 `-08` | 隧道类流量被代理转坏了。UA-Mask 靠「非 HTTP 目标自动卸载」解决：`nft list set inet fw4 UAmask_bypass_set` 看有没有学到 `节点IP.端口`；没有就把端口加进 `bypass_ports`。**UA3F 时代无解**（它劫持除 22 外的全部 TCP） |
 | 想改回原样 | 删 `/etc/nftables.d/10-ttl-fix.nft` + `fw4 reload`；LuCI 里把 MAC/MTU 去掉；`/etc/campus-portal-auth.sh --uninstall-hook` |
 
 ## 卸载
@@ -397,4 +401,4 @@ uci delete campus.main; uci commit campus
 
 - 抓包投放点 / AI 提示词：`PACKET-CAPTURE.md`、`AI-PROMPT.md`
 - Burp XML 压缩脚本：`burp-xml-summary.py`
-- 路由器固件（硬刷方案、UA2F 编译、救砖文档）：<https://github.com/2476818641/boot>
+- 路由器固件（硬刷方案、内置 UA-Mask、救砖文档）：<https://github.com/2476818641/boot>

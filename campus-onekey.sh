@@ -249,14 +249,27 @@ setup_disguise() {
 		say "    放行名单（不改写 + 命中即卸载出代理）：$_wl"
 	fi
 
-	# TTL：UA-Mask 没有 L3 功能，交给内核 nft 规则（除 LAN 网桥外所有出口统一）
-	_ttl="${TTL_VALUE:-$(ua_persona_ttl "${UA_STR:-$UAMASK_UA_DEFAULT}")}"
+	# TTL：UA-Mask 没有 L3 功能，交给内核 nft 规则（除 LAN 网桥外所有出口统一）。
+	# 固件里可能**已经内置**了这条规则（例如 AX6600 那套 fork 就是编进固件的）——
+	# 默认不动它，只在显式给了 TTL_VALUE 时才覆盖，免得脚本和固件互相改。
+	_ttl_want="$(ua_persona_ttl "${UA_STR:-$UAMASK_UA_DEFAULT}")"
 	_lan="$(lan_dev)"
-	if [ "$DRY_RUN" = 1 ]; then
+	_ttl_have=""
+	[ -f "$TTL_FILE" ] && _ttl_have="$(sed -n 's/.*ip ttl set \([0-9]*\).*/\1/p' "$TTL_FILE" 2>/dev/null | head -1)"
+	if [ -n "$_ttl_have" ] && [ -z "$TTL_VALUE" ]; then
+		say "    TTL → 保留固件自带的规则（当前 $_ttl_have；文件 $TTL_FILE）"
+		if [ "$_ttl_have" != "$_ttl_want" ]; then
+			warn "      注意：它与当前 UA 人设建议的 $_ttl_want 不一致（UA 说自己是哪个系统，TTL 就该对应：Windows=128 / Android·Linux·macOS=64）"
+			say  "      要改：TTL_VALUE=$_ttl_want sh $0 …（或直接编辑该文件后 fw4 reload）"
+		fi
+		_ttl="$_ttl_have"
+	elif [ "$DRY_RUN" = 1 ]; then
+		_ttl="${TTL_VALUE:-$_ttl_want}"
 		printf '    [dry-run] 写 %s: chain ttl_fix { oifname != { %s } ip ttl set %s; ip6 hoplimit set %s }\n' \
 			"$TTL_FILE" "$_lan" "$_ttl" "$_ttl"
 		printf '    [dry-run] fw4 reload\n'
 	else
+		_ttl="${TTL_VALUE:-$_ttl_want}"
 		mkdir -p "$(dirname "$TTL_FILE")"
 		[ -f "$TTL_FILE" ] && cp -f "$TTL_FILE" "$TTL_FILE.bak"
 		cat > "$TTL_FILE" <<-EOF

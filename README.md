@@ -29,7 +29,7 @@ sh /root/campus-onekey.sh 你的学号 你的密码
 | 步骤 | 具体动作 | 落点 |
 |---|---|---|
 | ① 伪装 | UA-Mask：把各设备 UA 统一成一台 PC；`QeeYouAcceler,Valve/Steam,HttpDns,Microsoft-CryptoAPI,Microsoft NCSI` 放行**且命中即卸载出代理**；非 HTTP 目标自动卸载到内核；`bypass_ports='22 443'`（443 不进代理 → Steam 等大流量不受影响） | `/etc/config/UAmask` → LuCI「服务 → UA MASK」 |
-| ① 伪装 | TTL 固定（与 UA 人设自洽：Windows=128 / Android·Linux·macOS=64）；同时停掉并清掉旧方案 UA3F（它会和 UA-Mask 抢 TCP） | `/etc/nftables.d/10-ttl-fix.nft`（fw4 的 keep.d，刷固件升级也在） |
+| ① 伪装 | TTL 固定（与 UA 人设自洽：Windows=128 / Android·Linux·macOS=64）。**固件里已经内置这条规则时脚本不动它**（例如 AX6600 那套 fork 就是编进固件的），只有显式给 `TTL_VALUE=64` 才覆盖；同时停掉并清掉旧方案 UA3F（它会和 UA-Mask 抢 TCP） | `/etc/nftables.d/10-ttl-fix.nft`（fw4 的 keep.d，刷固件升级也在） |
 | ② 认证 | 门户三步：`/api/login.php` → `/api/stat.php` → `/api/ack_auth.php`（先 GET 首页拿 `RAASSESSID`，再 POST `/api/ip.php`）；`pass` = `hex(AES-128-ECB(key, 4位随机前缀+密码))` | `/etc/config/campus`（明文密码，权限 600） |
 | ③ 启动项 | init.d（开机，LuCI「系统 → 启动项」可见）/ hotplug（网口上线）/ cron（每 5 分钟兜底） | `/etc/init.d/campus-onekey`、`/etc/hotplug.d/iface/99-campus-portal`、`/etc/crontabs/root` |
 

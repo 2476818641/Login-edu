@@ -5,6 +5,8 @@
 #
 # 一条命令走完三件事（顺序就是这个顺序：先伪装，再认证，最后装启动项）：
 #   ① 伪装   UA-Mask（把各设备的 UA 统一成一台 PC + 协议敏感流量放行/卸载到内核）+ TTL 内核规则
+#             TTL 是**双向**的：出站统一成人设值（Windows=128），入站把校园网关改成 1 的
+#             TTL 补回来 —— 少了入站那条，客户端 HTTPS 会全部连接超时（见下文 ttl_fix_in）
 #   ② 认证   本校门户三步接口 login.php → stat.php → ack_auth.php（pass 用 AES-128-ECB 加密）
 #   ③ 启动项 /etc/init.d/campus-onekey（开机）+ hotplug（网口上线）+ cron（每 5 分钟兜底）
 #
@@ -252,6 +254,19 @@ setup_disguise() {
 	# TTL：UA-Mask 没有 L3 功能，交给内核 nft 规则（除 LAN 网桥外所有出口统一）。
 	# 固件里可能**已经内置**了这条规则（例如 AX6600 那套 fork 就是编进固件的）——
 	# 默认不动它，只在显式给了 TTL_VALUE 时才覆盖，免得脚本和固件互相改。
+	#
+	# ★ 入站修复链（2026-09 新增，必须保证存在）：
+	#   校园网关会把「经 NAT 的客户端」的入站 TCP 的 TTL 改成 1。Linux 转发时
+	#   TTL 减 1 → 0 → 内核判定超时直接丢弃，表现为「客户端 HTTPS 全部连接超时，
+	#   而路由器自己 curl 同一个站点完全正常」。抓包实锤（AX6600 实测）：
+	#       104.69.162.222.443 > 10.30.176.186.56562: Flags [S.], ttl 1
+	#       183.240.99.224.443 > 10.30.176.186.52206: Flags [S.], ttl 1
+	#   为什么只有客户端 443 中招：本机连接是本地投递不转发；客户端 :80 被 UA-Mask
+	#   REDIRECT 到本机中转（由路由器重新发起出网连接）也不算转发；只有被
+	#   bypass_ports 豁免的 443 走真正的 NAT 转发路径。
+	#   这也解释了历史疑问：「旧路由器单用 UA-Mask 不行、加 UA3F 就行」——UA3F 是
+	#   tcp dport != {22}，连 443 也在本机中转，根本不需要 IP 转发。
+	#   修法：把入站 TCP 里 ttl <= 2 的异常值补回 64（正常互联网包 50-60，不受影响）。
 	_ttl_want="$(ua_persona_ttl "${UA_STR:-$UAMASK_UA_DEFAULT}")"
 	_lan="$(lan_dev)"
 	_ttl_have=""
@@ -263,28 +278,57 @@ setup_disguise() {
 			say  "      要改：TTL_VALUE=$_ttl_want sh $0 …（或直接编辑该文件后 fw4 reload）"
 		fi
 		_ttl="$_ttl_have"
+		# 保留固件规则的同时，确保入站修复链也在（老固件里通常只有出站链）
+		if grep -q 'chain[[:space:]]*ttl_fix_in' "$TTL_FILE" 2>/dev/null; then
+			say "    入站修复 → 已有 ttl_fix_in 链 ✓"
+		elif [ "$DRY_RUN" = 1 ]; then
+			printf '    [dry-run] 追加 chain ttl_fix_in 到 %s + fw4 reload\n' "$TTL_FILE"
+		else
+			cp -f "$TTL_FILE" "$TTL_FILE.bak"
+			cat >> "$TTL_FILE" <<-'EOF'
+
+			# 入站：校园网关把经 NAT 的客户端入站 TCP 的 TTL 改成 1，转发减 1 归零会被
+			# 内核直接丢弃 → 客户端 HTTPS 全部超时、路由器自己却正常。只补 <=2 的异常值。
+			chain ttl_fix_in {
+			    type filter hook prerouting priority mangle; policy accept;
+			    iifname "wan" ip protocol tcp ip ttl 0-2 ip ttl set 64
+			}
+			EOF
+			has fw4 && run fw4 reload
+			say "    入站修复 → 已补上 ttl_fix_in 链（不补的话客户端 HTTPS 会全超时）"
+		fi
 	elif [ "$DRY_RUN" = 1 ]; then
 		_ttl="${TTL_VALUE:-$_ttl_want}"
 		printf '    [dry-run] 写 %s: chain ttl_fix { oifname != { %s } ip ttl set %s; ip6 hoplimit set %s }\n' \
 			"$TTL_FILE" "$_lan" "$_ttl" "$_ttl"
+		printf '    [dry-run]          + chain ttl_fix_in { iifname "wan" ip protocol tcp ip ttl 0-2 ip ttl set 64 }\n'
 		printf '    [dry-run] fw4 reload\n'
 	else
 		_ttl="${TTL_VALUE:-$_ttl_want}"
 		mkdir -p "$(dirname "$TTL_FILE")"
 		[ -f "$TTL_FILE" ] && cp -f "$TTL_FILE" "$TTL_FILE.bak"
 		cat > "$TTL_FILE" <<-EOF
-		# campus-onekey.sh 生成：校园网防 TTL 检测
-		# fw4 会把 /etc/nftables.d/*.nft 包含进 table inet fw4。语义：除 LAN 网桥外所有出口，
-		# IPv4 TTL 与 IPv6 hop limit 统一成 $_ttl（与 UA 人设自洽：Windows=128 / Android·Linux·macOS=64）。
+		# campus-onekey.sh 生成：校园网防 TTL 检测（双向）
+		# fw4 会把 /etc/nftables.d/*.nft 包含进 table inet fw4。
+		# 出站：除 LAN 网桥外所有出口，IPv4 TTL 与 IPv6 hop limit 统一成 $_ttl
+		#       （与 UA 人设自洽：Windows=128 / Android·Linux·macOS=64）。
+		# 入站：校园网关把经 NAT 的客户端入站 TCP 的 TTL 改成 1，转发减 1 归零会被内核
+		#       直接丢弃 —— 表现为客户端 HTTPS 全部超时、而路由器自己 curl 一切正常。
+		#       这里只把 ttl <= 2 的异常值补回 64（正常互联网包是 50-60，不受影响）。
 		# 改值或关掉：改/删本文件后 fw4 reload
 		chain ttl_fix {
 		    type filter hook postrouting priority mangle + 1; policy accept;
 		    oifname != { $_lan } ip ttl set $_ttl
 		    oifname != { $_lan } ip6 hoplimit set $_ttl
 		}
+
+		chain ttl_fix_in {
+		    type filter hook prerouting priority mangle; policy accept;
+		    iifname "wan" ip protocol tcp ip ttl 0-2 ip ttl set 64
+		}
 		EOF
 		has fw4 && run fw4 reload
-		say "    TTL → 固定 $_ttl（排除 $_lan，规则 $TTL_FILE）"
+		say "    TTL → 固定 $_ttl（排除 $_lan）+ 入站修复链，规则 $TTL_FILE"
 	fi
 }
 
@@ -485,6 +529,13 @@ show_status() {
 		printf '卸载集合 : %s\n' "$(nft list set inet fw4 UAmask_bypass_set 2>/dev/null | grep -c 'elements' | sed 's/^0$/空（还没有非 HTTP 目标被卸载）/')"
 	fi
 	printf 'TTL 规则 : %s\n' "$([ -f "$TTL_FILE" ] && sed -n 's/.*ip ttl set \([0-9]*\).*/\1/p' "$TTL_FILE" | head -1 || echo 无)"
+	if [ -f "$TTL_FILE" ]; then
+		if grep -q 'chain[[:space:]]*ttl_fix_in' "$TTL_FILE" 2>/dev/null; then
+			printf '入站修复 : 有 ✅（校园网关把入站 TCP 的 TTL 改成 1，缺了它客户端 HTTPS 会全超时）\n'
+		else
+			printf '入站修复 : 缺 ⚠️  跑一次本脚本会自动补上（或 sh %s 账号 密码）\n' "$0"
+		fi
+	fi
 }
 
 # ════════════════════════════════════════════════ 主流程

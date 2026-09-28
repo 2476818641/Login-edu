@@ -70,3 +70,11 @@ rm -f /etc/nftables.d/10-ttl-fix.nft && fw4 reload      # 关掉 TTL 改写
   （又把流量拉回用户态），阻断 QUIC 会丢光 UDP 443（加速器/语音/QUIC 视频全废），都不做。
 - 在高通平台上若开了 NSS/ECM 硬件加速，被卸载的流可能绕过 netfilter，TTL 改写需要用上面的
   tcpdump 方式实测确认。
+
+## 许可
+
+本仓库（脚本与文档）以 **MIT** 发布，全文见 [`LICENSE`](LICENSE) —— 你可以自由取用、修改、再分发
+（包括改成适合你自己学校的样子），保留版权声明即可。
+
+> 脚本所**配置**的第三方软件保留各自许可：UA-Mask 为 **GPL-3.0-only**、EasyTier 为 **LGPL-3.0**、
+> luci-app-easytier 为 **Apache-2.0**。本仓库只包含调用与配置逻辑，不包含它们的源码。

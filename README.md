@@ -78,3 +78,6 @@ rm -f /etc/nftables.d/10-ttl-fix.nft && fw4 reload      # 关掉 TTL 改写
 
 > 脚本所**配置**的第三方软件保留各自许可：UA-Mask 为 **GPL-3.0-only**、EasyTier 为 **LGPL-3.0**、
 > luci-app-easytier 为 **Apache-2.0**。本仓库只包含调用与配置逻辑，不包含它们的源码。
+
+> ⚠️ 上面的 tcpdump 需要自己装：`apk add tcpdump`（本仓库那套固件默认没预装）。
+> 不想装可以用 nft 计数器等价判断：`nft insert rule inet fw4 postrouting oifname "wan" ip ttl != 128 counter`。

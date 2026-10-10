@@ -34,6 +34,7 @@
 #   sh campus-onekey.sh --dns-adgh           # 把 dnsmasq 指回 AdGuardHome(127.0.0.1:5625)
 #   sh campus-onekey.sh --clock              # 按校园门户的 Date 头校时（不需要外网 NTP；时钟偏移本身是检测项）
 #   sh campus-onekey.sh --log                # 只看本脚本留的健康日志（DNS / 443 / 时钟；没输出=正常）
+#   sh campus-onekey.sh --probe              # 探测本线路的出站端口策略（判断是"只封 443"还是"白名单受限"）
 #   sh campus-onekey.sh --uninstall          # 卸掉启动项 + cron + hotplug
 #   DRY_RUN=1 sh campus-onekey.sh 账号 密码    # 只打印要做的改动，不落盘
 #   SKIP_DISGUISE=1 sh campus-onekey.sh 账号 密码   # 跳过伪装（在别的固件上先只搞认证）
@@ -605,6 +606,34 @@ show_log() {	# 只看本脚本留的健康日志
 	info "  时钟与门户差 Ns，已自动按门户校时 / already online / auth ok"
 }
 
+# ── 出站端口策略探测 ────────────────────────────────────────────────
+# 什么时候用：--status 里"出站 443 不通"、但 HTTP/DNS 正常，想知道是"只封 443"
+# 还是"整条线路被扔进了白名单模式"。后者是大问题（门户里 acct 为空就是它的特征），
+# 而且会让隧道（11010）与 HTTPS 一起废掉。
+probe_out() {
+	local p o
+	info "出站端口策略探测（目标 223.5.5.5，按 IP 访问，不受 DNS 影响）"
+	if [ "$PING_TARGET" != "-" ] && ping -c 1 -W 2 "$PING_TARGET" >/dev/null 2>&1; then
+		printf '  ICMP      : 通\n'
+	else
+		printf '  ICMP      : 不通（本校常态，单独不能说明问题）\n'
+	fi
+	for p in ${PROBE_PORTS:-80 443 8080 8443 8888 2052 11010}; do
+		o="$(curl -v -m 4 -o /dev/null "http://223.5.5.5:$p/" 2>&1)"
+		case "$o" in
+			*onnected*) printf '  TCP %-5s : 放行（TCP 连上了）\n' "$p" ;;
+			*refused*)  printf '  TCP %-5s : 放行（对面没服务＝包出去了）\n' "$p" ;;
+			*timed*)    printf '  TCP %-5s : **被挡**（超时，包被丢）\n' "$p" ;;
+			*)          printf '  TCP %-5s : 结果不明（%s）\n' "$p" "$(printf '%s' "$o" | tail -1)" ;;
+		esac
+	done
+	info "怎么读："
+	info "  只有 80 / 53 通        → 线路被扔进「白名单/受限」状态：HTTPS、隧道(11010) 一起废"
+	info "                           门户里 acct 为空、logined=1 正是这个状态的特征"
+	info "  只有 443 被挡          → 单纯封 HTTPS，HTTP 与隧道正常"
+	info "  都通                   → 正常"
+}
+
 uninstall_autostart() {
 	info "卸载启动项"
 	[ -x /etc/init.d/campus-onekey ] && { /etc/init.d/campus-onekey disable >/dev/null 2>&1; /etc/init.d/campus-onekey stop >/dev/null 2>&1; }
@@ -786,8 +815,9 @@ case "${1:-}" in
 --dns-adgh)  MODE="dnsagh"; shift ;;
 --clock)     MODE="clock"; shift ;;
 --log)       MODE="log"; shift ;;
+--probe)     MODE="probe"; shift ;;
 --uninstall) MODE="uninstall"; shift ;;
---help|-h)   sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+--help|-h)   sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 --*)          die "未知参数：$1（试试 --help）" ;;
 esac
 # 账号密码的位置随用法而变：`… 账号 密码` 与 `… --auth 账号 密码` 都要能用
@@ -806,6 +836,7 @@ dnsfb)     dns_set fallback; exit 0 ;;
 dnsagh)    dns_set adgh; exit 0 ;;
 clock)     clock_sync || die "拿不到门户时间 —— $PORTAL 打不开？"; exit 0 ;;
 log)       show_log "${1:-}"; exit 0 ;;
+probe)     probe_out; exit 0 ;;
 uninstall) uninstall_autostart; exit 0 ;;
 esac
 

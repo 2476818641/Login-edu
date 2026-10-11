@@ -954,15 +954,28 @@ do_pause() {
 }
 do_resume() {
 	info "恢复 EasyTier 隧道"
+	# ★ uci 的 enabled 必须是 1，否则 `/etc/init.d/easytier start` 只打印 "start.."、
+	#   什么都不做 —— 该 init 的逻辑是 `[ "$(uci -q get …enabled)" = "1" ] && start_et`。
+	#   实测踩过：--pause（stop+disable）之后 --resume 起不来，症状就是
+	#   "start.. 之后没有 tun0、/tmp/easytier.log 是空的、easytier-cli 连不上 15888"。
+	if [ "$(et_get enabled)" != "1" ]; then
+		warn "    uci 里 easytier.…enabled=$(et_get enabled)（不是 1）→ init 不会真的启动，先修回来"
+		et_set enabled '1'
+		run uci commit easytier
+	fi
 	run /etc/init.d/easytier enable
 	run /etc/init.d/easytier start
 	[ "$DRY_RUN" = 1 ] && return 0
-	sleep 10
+	sleep 12
 	if ip link show "$(tun_dev)" >/dev/null 2>&1; then
 		say "    隧道设备 $(ip -br addr show "$(tun_dev)" 2>/dev/null | tr -s ' ') 已就绪 ✓"
 	else
-		warn "    没看到隧道设备 $(tun_dev) —— 看 /tmp/easytier.log 最后几行"
-		tail -n 8 /tmp/easytier.log 2>/dev/null | sed 's/^/      /'
+		warn "    没看到隧道设备 $(tun_dev)。按这个顺序查："
+		warn "      1) uci show easytier | grep -E 'enabled|etcmd'   # enabled 必须 1、etcmd 必须 config"
+		warn "      2) wc -c /tmp/easytier.log                      # 0 字节 = init 根本没进 start_et"
+		warn "      3) sh $0 --toml                                 # 重新生成并校验 config.toml"
+		log="$(tail -n 8 /tmp/easytier.log 2>/dev/null)"
+		[ -n "$log" ] && printf '%s\n' "$log" | sed 's/^/      /' || warn "      （/tmp/easytier.log 是空的，印证了第 2 条）"
 	fi
 	info "对端："
 	has easytier-cli && easytier-cli peer 2>/dev/null | sed 's/^/      /'

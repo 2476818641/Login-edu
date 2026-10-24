@@ -42,6 +42,7 @@
 #   sh campus-onekey.sh --uninstall          # 卸掉启动项 + cron + hotplug
 #   DRY_RUN=1 sh campus-onekey.sh 账号 密码    # 只打印要做的改动，不落盘
 #   SKIP_DISGUISE=1 sh campus-onekey.sh 账号 密码   # 跳过伪装（在别的固件上先只搞认证）
+#   CURL_INSECURE=1 sh campus-onekey.sh 账号 密码    # https 门户是自签名证书时跳过校验
 #   TTL_VALUE=64 UA_STR='Mozilla/5.0 (Linux; Android 14; …)' sh campus-onekey.sh 账号 密码
 #
 # 换学校要改的只有下面「本校参数」那一段（门户地址、三个接口路径、字段名、加密 key）。
@@ -60,7 +61,7 @@ USER_FIELD="${USER_FIELD:-user}"
 PASS_FIELD="${PASS_FIELD:-pass}"
 RAAS_KEY="${RAAS_KEY:-5a3b9f207411a8ed}"				# AES-128-ECB 密钥（门户 JS 里那把）
 RET_ACCEPT="${RET_ACCEPT:-0 3 121 122}"					# 这些 ret = 已接受，继续下一步
-RET_RETRY="${RET_RETRY:-2 3 4}"						# 这些 ret = 处理中，等一会再问
+RET_RETRY="${RET_RETRY:-2 4}"						# 这些 ret = 处理中，等一会再问（3 已在 RET_ACCEPT 里，别再放这里）
 RET_MAX_TRY="${RET_MAX_TRY:-6}"
 RET_SLEEP="${RET_SLEEP:-3}"
 # 伪装默认值（TTL 由 UA 人设推导：Windows→128 / Android·Linux·macOS→64）
@@ -77,7 +78,10 @@ HOOKDIR="${HOOKDIR:-/etc/hotplug.d/iface}"
 HOOKFILE="$HOOKDIR/99-campus-portal"
 INITHOOK="${INITHOOK:-/etc/init.d/campus-onekey}"
 CONF="${CAMPUS_UCI_FILE:-/etc/config/campus}"		# 账号密码存这里（600）
-COOKIE="${COOKIE:-/tmp/campus-onekey.cookie}"
+COOKIE="${COOKIE:-/tmp/campus-onekey.$$.cookie}"	# 按 PID 分开：并发时别互删会话
+AUTH_FAIL_MARK="${AUTH_FAIL_MARK:-/tmp/.campus-auth-fail}"	# 认证被拒后的退避标记
+LOCKDIR="${LOCKDIR:-/tmp/campus-onekey.lock}"		# 入口互斥锁（mkdir 原子锁）
+CURL_INSECURE="${CURL_INSECURE:-0}"			# 1=https 门户也跳过证书校验
 CHECK_URL="${CHECK_URL:-http://connect.rom.miui.com/generate_204}"
 PING_TARGET="${PING_TARGET:-223.5.5.5}"			# PING_TARGET=- 表示不做 ping 判定（测试用）
 DRY_RUN="${DRY_RUN:-0}"
@@ -87,6 +91,7 @@ SKIP_DISGUISE="${SKIP_DISGUISE:-0}"
 CLOCK_AUTO="${CLOCK_AUTO:-1}"
 # do_login 用：1=被门户明确拒绝（账号密码错等）→ 调用方别去装"每 5 分钟重试"的启动项
 AUTH_FATAL=0
+RAAS_ERR=''	# raas_encode 的失败原因（必须在当前 shell 里调用才能读到）
 UA_STR="${UA_STR:-}"
 UA_MODE="${UA_MODE:-regex}"				# regex（正表，推荐）/ all（全量）
 UA_WHITELIST="${UA_WHITELIST:-}"
@@ -102,7 +107,7 @@ log()  { logger -t campus-onekey "$*" 2>/dev/null || true; }
 # 为什么要自己落文件：logd 的环形缓冲只有 ~16 KB，而 crond 每跑一次任务就写一行
 # （每 5 分钟一条 "cmd /etc/campus-onekey.sh --auto"），加上心跳，一天就能把缓冲冲干净 ——
 # 实测踩过：443 红了几小时，--log 里却只剩 cron 噪音，什么都看不到。
-# 做 1~2 天的 A/B 实验（--pause 隧道）全靠这个文件，所以不能再依赖 syslog 缓冲。
+# 做 1~2 天的 A/B 实验（手动暂停隧道）全靠这个文件，所以不能再依赖 syslog 缓冲。
 EVENTS="${EVENTS:-/etc/campus-events.log}"
 event() {
 	log "$*"
@@ -139,6 +144,9 @@ ask() {	# ask <提示> <默认值> → $REPLY
 # 这正是"校园网放行了、但本机解析不了域名"时唯一靠得住的判据。
 ONLINE_IP_PROBES="${ONLINE_IP_PROBES:-http://223.5.5.5/ http://114.114.114.114/}"
 TCP_CODE=''	# tcp_out 成功后填最后一次的 HTTP 状态码（注意：tcp_out 必须在当前 shell 里调，$() 里调是子 shell，看不到）
+ONLINE_REASON=''	# online() 的判定依据（204 / ip-404 / portal-redirect / portal-page / none）
+HTTPS_ERR=''	# https_out() 失败原因（timeout / refused / tls / no-response）
+DNS_UNKNOWN=0	# 1=没有 nslookup/dig/host，dns_ok 无法判断（不要据此报"DNS 挂了"）
 tcp_out() {
 	local u c
 	for u in $ONLINE_IP_PROBES; do
@@ -149,15 +157,27 @@ tcp_out() {
 }
 # 本机 DNS（dnsmasq → AdGuardHome:5625）能不能解析。跟"校园网放没放行"是两件事，
 # 但体感一模一样（都是"上不了网"），所以必须分开判定、分开报。
+# ★ 没有 nslookup/dig/host 时不能用 `ping 域名` 代替：本校 ICMP 被挡，
+#   ping 一定失败，会把"DNS 正常"误报成"DNS 挂了"。
 dns_ok() {
 	local n
+	DNS_UNKNOWN=0
 	if has nslookup; then
 		for n in www.baidu.com www.qq.com; do
 			nslookup "$n" 127.0.0.1 >/dev/null 2>&1 && return 0
 		done
 		return 1
 	fi
-	ping -c 1 -W 3 www.baidu.com >/dev/null 2>&1
+	if has dig; then
+		dig +short +time=3 +tries=1 www.baidu.com @127.0.0.1 >/dev/null 2>&1 && return 0
+		return 1
+	fi
+	if has host; then
+		host www.baidu.com 127.0.0.1 >/dev/null 2>&1 && return 0
+		return 1
+	fi
+	DNS_UNKNOWN=1
+	return 0
 }
 # ── 出站端口探测 ────────────────────────────────────────────────────
 # ★ 方法论警告（我自己踩过，写下来免得再犯）：
@@ -179,24 +199,37 @@ et_tun() {	# 隧道网卡名：优先 uci，其次 /etc/easytier/config.toml 里
 	printf '%s' "${t:-tun0}"
 }
 probe_one() {	# probe_one <host> <port> → open | block | unknown
-	local r
-	r="$(curl -s -m 4 -o /dev/null -w '%{errormsg}' "http://$1:$2/" 2>/dev/null)"
-	case "$r" in
-		'')           printf 'open' ;;	# 没报错 = TCP 连上并拿到响应
-		*efused*)     printf 'open' ;;	# 对面没服务，但包出去了
-		*'Empty reply'*|*'HTTP/0.9'*|*'not allowed'*) printf 'open' ;;	# 连上了，只是对面不说 HTTP（如 TLS 端口）
-		*imed*|*imeout*) printf 'block' ;;
-		*)            printf 'unknown' ;;
+	local r rc
+	r="$(curl -s -m 4 -o /dev/null -w '%{errormsg}' "http://$1:$2/" 2>/dev/null)"; rc=$?
+	if [ -n "$r" ]; then
+		case "$r" in
+			*efused*)     printf 'open' ;;	# 对面没服务，但包出去了
+			*'Empty reply'*|*'HTTP/0.9'*|*'not allowed'*) printf 'open' ;;	# 连上了，只是对面不说 HTTP（如 TLS 端口）
+			*imed*|*imeout*) printf 'block' ;;
+			*)            printf 'unknown' ;;
+		esac
+		return 0
+	fi
+	# errormsg 为空有两种可能：请求成功，或这个 curl 根本不支持 %{errormsg}。
+	# 后者以前会被当成 open，导致 --probe 全部显示"放行"；这里退回退出码。
+	case "$rc" in
+		0|52|56|35|51|60) printf 'open' ;;
+		28)               printf 'block' ;;
+		*)                printf 'unknown' ;;
 	esac
 }
 probe_word() { case "$1" in open) printf '放行' ;; block) printf '被挡（超时）' ;; *) printf '结果不明' ;; esac; }
 # 线路档位：**按实测**判断，别去猜门户字段（acct 为空在本门户是常态，正常时也空）。
 line_tier() {
 	if https_out; then printf '正常（HTTPS 可用）'; return 0; fi
+	case "$HTTPS_ERR" in
+		tls)     printf '⚠️ 443 端口可达，但 TLS 握手失败（不是被丢包；查证书/中间盒）'; return 0 ;;
+		refused) printf '⚠️ 443 连接被拒绝（RST）—— 端口没被静默丢，但 HTTPS 不可用'; return 0 ;;
+	esac
 	if tunnel_up; then
 		# 隧道还活着 = 它是**限制开始之前**就建好的（实测：限制期间新建连接全失败，
-		# 但已建立的流会一直活着）。这时能靠 --https-route 把 443 塞进隧道。
-		printf '⚠️ 新建到 443 的连接被挡（HTTPS 全挂），但隧道还活着（限制前建好的）→ 可用 --https-route 把 443 塞进隧道'
+		# 但已建立的流会一直活着）。这时可考虑把 443 路由进隧道（本脚本没有内置这个开关）。
+		printf '⚠️ 新建到 443 的连接被挡（HTTPS 全挂），但隧道还活着（限制前建好的）→ 可手动把 443 路由进隧道'
 	else
 		printf '⚠️ 受限状态：实测新建到 443、11010、STUN 端口的连接都建不起来（只有 80/53 通）—— 隧道也只能在限制开始前建好'
 	fi
@@ -206,18 +239,47 @@ line_tier() {
 # 还会把 AdGuardHome 的 DoH 上游拖成 30 秒超时 → 全屋 DNS 归零。
 # 只做观测：留条时间线，下次"突然断网"能直接对上号。
 https_out() {
-	local c
-	c="$(curl -sk -m 6 -o /dev/null -w '%{http_code}' https://${PROBE_HOST:-223.5.5.5}/ 2>/dev/null)"
-	case "$c" in ''|000) return 1 ;; *) return 0 ;; esac
+	local c rc
+	HTTPS_ERR=''
+	c="$(curl -sk -m 6 -o /dev/null -w '%{http_code}' "https://${PROBE_HOST:-223.5.5.5}/" 2>/dev/null)"; rc=$?
+	case "$rc" in
+		28)      HTTPS_ERR='timeout'; return 1 ;;
+		7)       HTTPS_ERR='refused'; return 1 ;;
+		35|51|60) HTTPS_ERR='tls'; return 1 ;;
+	esac
+	case "$c" in ''|000) HTTPS_ERR='no-response'; return 1 ;; esac
+	return 0
 }
-# 外网通不通。★ 顺序有讲究：本校校园网把 ICMP 挡了，`ping 223.5.5.5` 从来不通，
-# 而那时 TCP 明明是通的。老写法（先 ping、再 curl 域名）在"AGH 挂了"时会判成"外网不通"，
-# 于是脚本报"认证没成功"，人就去反复重认证 —— 白折腾（实测踩过）。
+# 是否已经"认证后能上网"。
+# ★ 不能把"80 能连上"当成"已认证"：未认证时网关常把 HTTP 302/200 到门户，
+#   tcp_out 会成功，但登录其实没发生。这里要求 204 探针，
+#   或按 IP 探测拿到"不像门户"的响应（重定向到门户 / 登录页都算未认证）。
+#   诊断"TCP 出不出得去"仍用 tcp_out，两件事别混。
 online() {
-	[ "$PING_TARGET" != "-" ] && ping -c 1 -W 2 "$PING_TARGET" >/dev/null 2>&1 && return 0
-	tcp_out && return 0
-	_c="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "$CHECK_URL" 2>/dev/null)"
-	case "$_c" in 200|204) return 0 ;; esac
+	ONLINE_REASON=''
+	_c="$(curl -s -m 6 -o /dev/null -w '%{http_code}' "$CHECK_URL" 2>/dev/null)"
+	[ "$_c" = 204 ] && { ONLINE_REASON='204'; return 0; }
+
+	_ph="${PORTAL#*://}"; _ph="${_ph%%/*}"
+	for _u in $ONLINE_IP_PROBES; do
+		_c="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$_u" 2>/dev/null)"
+		case "$_c" in ''|000) continue ;; esac
+		_loc="$(curl -s -m 5 -o /dev/null -w '%{redirect_url}' "$_u" 2>/dev/null)"
+		case "$_loc" in
+			*"$_ph"*) ONLINE_REASON='portal-redirect'; continue ;;
+		esac
+		case "$_c" in
+			2??)
+				_body="$(curl -s -m 5 "$_u" 2>/dev/null | head -c 400)"
+				case "$_body" in
+					*'<form'*|*'login'*|*'登录'*|*'认证'*) ONLINE_REASON='portal-page'; continue ;;
+				esac
+				ONLINE_REASON="ip-$_c"; return 0 ;;
+			*)
+				ONLINE_REASON="ip-$_c"; return 0 ;;
+		esac
+	done
+	ONLINE_REASON="${ONLINE_REASON:-none}"
 	return 1
 }
 # 认证提交后墙要几秒才放开，给它几次机会
@@ -271,11 +333,13 @@ rand_byte() {
 #   hex( AES-128-ECB( key="5a3b9f207411a8ed", 明文 = 4 个随机字符 + 真实密码, ZeroPadding ) )
 # 服务端解出来后会剥掉前 4 个字符。若输入本身已是 32 位 [0-9A-Za-z]，按门户 JS 的语义直接透传。
 raas_encode() {	# raas_encode <明文密码> → 32 位 hex；失败原因写进 RAAS_ERR
+	local _keyhex _alpha _nonce _i _r _plain _pad
 	RAAS_ERR=""
 	case "$1" in
 		????????????????????????????????)	# 正好 32 位
 			case "$1" in *[!0-9A-Za-z]*) ;; *) printf '%s' "$1"; return 0 ;; esac ;;
 	esac
+	[ "${#RAAS_KEY}" -eq 16 ] || { RAAS_ERR="RAAS_KEY 必须是 16 个字符（AES-128）"; return 1; }
 	has openssl || { RAAS_ERR="没有 openssl（固件里要带 openssl-util）"; return 1; }
 	_keyhex="$(printf '%s' "$RAAS_KEY" | hexify 2>/dev/null)"
 	[ -n "$_keyhex" ] || { RAAS_ERR="没有可用的 hex 转换工具（od/hexdump/base64 都没有）"; return 1; }
@@ -297,20 +361,54 @@ raas_encode() {	# raas_encode <明文密码> → 32 位 hex；失败原因写进
 # 在 `uci set campus.main='main'` 这种建段语法上会报 "Entry not found"（真机实测），
 # 直接写文件最稳；读回来对得上才算成功，不谎报。
 uci_escape() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+# 密码默认用 base64 存：单引号、反斜杠、换行都不会破坏 UCI 语法。
+# 没有 base64 时退回明文，但拒绝反斜杠/换行（它们会让 libuci 解析出错或被吃掉）。
 write_conf() {	# write_conf <user> <pass>
 	_tmp="$CONF.tmp.$$"
-	{
-		printf '%s\n' '# 由 campus-onekey.sh 生成（含明文密码，权限 600）'
+	_pass_opt='pass'
+	_pass_val="$2"
+	_unsafe=0
+	case "$2" in *'\'*) _unsafe=1 ;; esac
+	[ "$(printf '%s' "$2" | wc -l)" -gt 0 ] && _unsafe=1
+	if has base64; then
+		_pass_opt='pass_b64'
+		_pass_val="$(printf '%s' "$2" | base64 | tr -d '\n')"
+	elif [ "$_unsafe" = 1 ]; then
+		warn "密码含反斜杠/换行，且系统没有 base64，无法安全写入 $CONF"
+		return 1
+	fi
+	( umask 077
+	  {
+		printf '%s\n' '# 由 campus-onekey.sh 生成（含密码，权限 600）'
 		printf '%s\n' "config main 'main'"
 		printf "\toption user '%s'\n" "$(uci_escape "$1")"
-		printf "\toption pass '%s'\n" "$(uci_escape "$2")"
+		printf "\toption %s '%s'\n" "$_pass_opt" "$_pass_val"
 		printf "\toption auth_url '%s'\n" "$(uci_escape "$PORTAL")"
 		printf "\toption api_paths '%s'\n" "$(uci_escape "$API_PATHS")"
-	} > "$_tmp" || return 1
+	  } > "$_tmp"
+	) || { rm -f "$_tmp"; return 1; }
+	chmod 600 "$_tmp" 2>/dev/null || true
+
+	# 内容没变就别碰 flash（掉线时 --auto 每 5 分钟调一次 do_login）
+	_same=0
+	if [ -f "$CONF" ]; then
+		if has cmp; then
+			cmp -s "$_tmp" "$CONF" && _same=1
+		elif [ "$(cat "$_tmp" 2>/dev/null)" = "$(cat "$CONF" 2>/dev/null)" ]; then
+			_same=1
+		fi
+	fi
+	if [ "$_same" = 1 ]; then rm -f "$_tmp"; return 0; fi
+
 	mv -f "$_tmp" "$CONF" || { rm -f "$_tmp"; return 1; }
 	chmod 600 "$CONF" 2>/dev/null
 	if has uci; then
-		[ "$(uci -q get campus.main.pass 2>/dev/null)" = "$2" ] || return 1
+		if [ "$_pass_opt" = pass_b64 ]; then
+			_got="$(uci -q get campus.main.pass_b64 2>/dev/null | base64 -d 2>/dev/null)"
+		else
+			_got="$(uci -q get campus.main.pass 2>/dev/null)"
+		fi
+		[ "$_got" = "$2" ] || return 1
 		uci -q commit campus 2>/dev/null || true
 	fi
 	return 0
@@ -318,6 +416,12 @@ write_conf() {	# write_conf <user> <pass>
 read_conf() {	# 从配置里取 user/pass（环境变量优先）
 	CAMPUS_USER="${CAMPUS_USER:-$(uget campus.main.user)}"
 	CAMPUS_PASS="${CAMPUS_PASS:-$(uget campus.main.pass)}"
+	if [ -z "${CAMPUS_PASS:-}" ]; then
+		_pb="$(uget campus.main.pass_b64)"
+		if [ -n "$_pb" ] && has base64; then
+			CAMPUS_PASS="$(printf '%s' "$_pb" | base64 -d 2>/dev/null)"
+		fi
+	fi
 }
 
 # ════════════════════════════════════════════════ ① 伪装：UA-Mask + TTL
@@ -338,7 +442,7 @@ disable_ua3f() {	# 旧的 UA3F 会和 UA-Mask 抢 TCP，必须停掉并清表
 	run /etc/init.d/ua3f stop
 	# ⚠️ 关键：UA3F 的 stop 不清 nft。残留的 `tcp dport != {22} redirect to :1080`
 	# 会把除 22 外的所有 TCP 吸进没人监听的端口 → "电脑没网但 ping 正常"
-	has nft && run nft delete table inet UA3F
+	if has nft; then run nft delete table inet UA3F 2>/dev/null || true; fi
 }
 
 lan_dev() {	# TTL 规则要排除的 LAN 网桥
@@ -371,8 +475,9 @@ chain ttl_fix_in {
     # ★ 上行接口不写死 wan：换成校园 WiFi 上行（STA，通常叫 wwan）时，
     #   写死 iifname "wan" 会让这条规则失效 → 换 WiFi 后全屋客户端 HTTPS/游戏立刻全挂，
     #   而路由器自己正常（这个"只有客户端坏"的坑我们踩过两次）。
-    iifname != { $lan } ip protocol tcp ip ttl 0-2 ip ttl set 64
-    iifname != { $lan } ip protocol udp ip ttl 0-2 ip ttl set 64
+    iifname != { $lan } ip protocol tcp ip ttl 0-2 ip ttl set $ttl
+    iifname != { $lan } ip protocol udp ip ttl 0-2 ip ttl set $ttl
+    iifname != { $lan } ip6 hoplimit 0-2 ip6 hoplimit set $ttl
 }
 EOF
 }
@@ -412,7 +517,15 @@ setup_ttl() {
 		mkdir -p "$(dirname "$TTL_FILE")"
 		[ -f "$TTL_FILE" ] && cp -f "$TTL_FILE" "$TTL_FILE.bak"
 		ttl_file_body "$_lan" "$_ttl" > "$TTL_FILE"
-		has fw4 && run fw4 reload
+		if has fw4; then
+			if ! run fw4 reload; then
+				warn "    fw4 reload 失败，回滚 TTL 规则"
+				if [ -f "$TTL_FILE.bak" ]; then cp -f "$TTL_FILE.bak" "$TTL_FILE"; else rm -f "$TTL_FILE"; fi
+				run fw4 reload || warn "    回滚后 fw4 reload 仍失败，请检查 nft 规则"
+			fi
+		else
+			warn "    没有 fw4：$TTL_FILE 不会被加载（fw3/iptables 固件需要另外的 TTL 方案）"
+		fi
 		if [ -n "$_ttl_have" ] && [ "$_ttl_have" = "$_ttl" ]; then
 			say "    TTL → 入站修复已补齐 TCP+UDP（出站仍为 $_ttl，人设值未改）"
 		else
@@ -472,20 +585,28 @@ setup_disguise() {
 }
 
 # ════════════════════════════════════════════════ ② 认证：本校门户三步
-curl_auth() { curl -s -m 15 -k "$@"; }	# 不走 UA 伪装（路由器自身流量不经 UA-Mask）
+curl_auth() {	# 不走 UA 伪装（路由器自身流量不经 UA-Mask）
+	# http 门户加 -k 无影响；https 门户默认校验证书，自签名证书用 CURL_INSECURE=1
+	case "$PORTAL" in
+		https://*) if [ "$CURL_INSECURE" = 1 ]; then curl -s -m 15 -k "$@"; else curl -s -m 15 "$@"; fi ;;
+		*)         curl -s -m 15 -k "$@" ;;
+	esac
+}
 
 json_strip_jsonp() {
 	case "$(printf '%s' "$1" | tr -d ' \t\r\n')" in
-		'{'*|'['*) printf '%s' "$1" ;;
-		*'('*')'*) printf '%s' "$1" | sed 's/^[^(]*(//; s/)[[:space:]]*;*[[:space:]]*$//' ;;
-		*)         printf '%s' "$1" ;;
+		'{'*|'['*) printf '%s' "$1"; return 0 ;;
 	esac
+	# 只剥 "identifier(...);" 这种真正的 JSONP；HTML 错误页里的括号不要碰
+	_j="$(printf '%s' "$1" | sed -n 's/^[[:space:]]*[A-Za-z_$][A-Za-z0-9_$.]*[[:space:]]*(\(.*\))[[:space:]]*;*[[:space:]]*$/\1/p')"
+	if [ -n "$_j" ]; then printf '%s' "$_j"; else printf '%s' "$1"; fi
 }
-json_num() { printf '%s' "$1" | tr -d '\n' | sed -n "s/.*\"$2\":\(-\{0,1\}[0-9][0-9]*\).*/\1/p" | head -1; }
-json_str() { printf '%s' "$1" | tr -d '\n' | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" | head -1; }
+json_num() { printf '%s' "$1" | tr -d '\n' | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"*\(-\{0,1\}[0-9][0-9]*\)\"*.*/\1/p" | head -1; }
+json_str() { printf '%s' "$1" | tr -d '\n' | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
 
 do_login() {
 	info "② 认证：$PORTAL"
+	AUTH_FATAL=0
 	read_conf
 	if [ -z "${CAMPUS_USER:-}" ] || [ -z "${CAMPUS_PASS:-}" ]; then
 		if [ "$QUIET" = 1 ]; then warn "    没有账号密码（跑一次：sh $0 账号 密码）"; return 1; fi
@@ -496,8 +617,21 @@ do_login() {
 	fi
 	[ -n "$CAMPUS_USER" ] || { warn "    账号为空"; return 1; }
 	_plain="$CAMPUS_PASS"
-	PASSV="$(raas_encode "$_plain")" || { warn "    加密失败：$RAAS_ERR"; return 1; }
-	# 存账号密码（明文，600），下次 --auto 就不用再给
+	# ★ 不要在 $() 里调 raas_encode：子 shell 里的 RAAS_ERR 传不回来，
+	#   而 set -u 下引用未定义的 RAAS_ERR 会直接让脚本退出。
+	#   重定向到文件，函数就在当前 shell 里跑。
+	if ! raas_encode "$_plain" > "$COOKIE.pass" 2>/dev/null; then
+		warn "    加密失败：${RAAS_ERR:-未知原因}"
+		rm -f "$COOKIE.pass"
+		return 1
+	fi
+	PASSV="$(cat "$COOKIE.pass" 2>/dev/null)"
+	rm -f "$COOKIE.pass"
+	if [ "${#PASSV}" -ne 32 ]; then
+		warn "    加密结果长度异常（${#PASSV}）：检查 RAAS_KEY（16 字符）/ openssl"
+		return 1
+	fi
+	# 存账号密码（600；密码 base64），下次 --auto 就不用再给
 	if [ "$DRY_RUN" = 1 ]; then
 		printf '    [dry-run] 写 %s（user=%s）\n' "$CONF" "$CAMPUS_USER"
 	else
@@ -528,7 +662,7 @@ do_login() {
 		return 0
 	fi
 
-	# ② 按顺序提交三步（门户 JS 的语义：ret 0/3/121/122 继续；stat 的 2/3/4 = 处理中要轮询；login 的 4 = 密码错）
+	# ② 按顺序提交三步（门户 JS 的语义：ret 0/3/121/122 继续；stat 的 2/4 = 处理中要轮询；login 的 4 = 密码错）
 	STEP=0; TOTAL_STEPS=$(printf '%s' "$API_PATHS" | tr ',' ' ' | wc -w)
 	LAST_MSG=""; LAST_RET=""; OK_MSG=""; FAILED=0
 	for _path in $(printf '%s' "$API_PATHS" | tr ',' ' '); do
@@ -549,7 +683,10 @@ do_login() {
 			say "    [$STEP/$TOTAL_STEPS] $_path → ret=${RET:-?} msg=${MSG:-（空）}$([ "$_try" -gt 1 ] && echo "（第 $_try 次）")"
 			LAST_MSG="$MSG"; LAST_RET="$RET"
 			case "$MSG" in *'成功'*|*'success'*|*'已在线'*) OK_MSG="$MSG" ;; esac
-			[ -z "$RET" ] && break
+			[ -z "$RET" ] && {
+				warn "    响应不是可解析的 JSON（$_path）：$(printf '%s' "$RESP" | head -c 160)"
+				break
+			}
 			ret_in "$RET" "$RET_ACCEPT" && break
 			if [ "$STEP" = 1 ] && [ "$RET" = 4 ]; then
 				warn "    账号或密码不正确（ret=4 msg=$MSG）"
@@ -582,16 +719,31 @@ do_login() {
 		event "认证成功（user=$CAMPUS_USER）"
 		return 0
 	fi
-	# 门户说成功、却还是上不了网 —— 必须分清是"校园网没放行"还是"本机 DNS 挂了"：
-	# 两者体感一样，但处理方式完全相反（一个是校园网的事，一个是路由器自己的事）。
+	# 门户说成功、却还是上不了网：先看是不是被网关劫持到门户（最常见），
+	# 再区分"本机 DNS 挂了"还是"网关只放行了 80"。
+	case "$ONLINE_REASON" in
+		portal-redirect|portal-page)
+			warn "    网关把 HTTP 劫持到门户（$ONLINE_REASON）—— 认证没有生效，不是 DNS 问题"
+			event "认证未生效：HTTP 被劫持到门户"
+			return 1 ;;
+	esac
 	if tcp_out; then
-		warn "    校园网其实**已经放行**（按 IP 的 TCP 出得去，刚测到 HTTP $TCP_CODE），是本机解析不了域名"
-		warn "    → 大概率 dnsmasq → AdGuardHome(127.0.0.1:5625) 挂了。查："
-		warn "        pgrep -f AdGuardHome || echo 'AGH 没在跑'"
-		warn "        nslookup www.baidu.com 127.0.0.1     # 超时/无响应就是这个原因"
-		warn "      应急恢复：sh $0 --dns-fallback（还不行再看 logread | grep -iE 'adguard|dnsmasq'）"
-		event "认证成功，但本机 DNS 不通（tcp=$TCP_CODE）"
-		return 0	# 认证本身是成功的 —— 返回 0，别让 cron 每 5 分钟反复重登
+		if [ "$DNS_UNKNOWN" = 1 ]; then
+			warn "    按 IP 的 TCP 出得去（HTTP $TCP_CODE），但没有 nslookup/dig，无法判断 DNS"
+			return 1
+		fi
+		if ! dns_ok; then
+			warn "    校园网其实**已经放行**（按 IP 的 TCP 出得去，刚测到 HTTP $TCP_CODE），是本机解析不了域名"
+			warn "    → 大概率 dnsmasq → AdGuardHome(127.0.0.1:5625) 挂了。查："
+			warn "        pgrep -f AdGuardHome || echo 'AGH 没在跑'"
+			warn "        nslookup www.baidu.com 127.0.0.1     # 超时/无响应就是这个原因"
+			warn "      应急恢复：sh $0 --dns-fallback（还不行再看 logread | grep -iE 'adguard|dnsmasq'）"
+			event "认证成功，但本机 DNS 不通（tcp=$TCP_CODE）"
+			return 0	# 认证本身是成功的 —— 返回 0，别让 cron 每 5 分钟反复重登
+		fi
+		warn "    按 IP 的 TCP 出得去（HTTP $TCP_CODE），但没有通过 204/直连判据"
+		warn "    可能网关只放行了 80，或返回了伪装页面；用 --status / --probe 看全貌"
+		return 1
 	fi
 	warn "    提交了但外网还不通（ret=${LAST_RET:-?} msg=$LAST_MSG）"
 	return 1
@@ -610,49 +762,51 @@ install_autostart() {
 	# ① 把自己放到固定路径（cron/hotplug/init.d 都引用它）
 	_me="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 	if [ "$_me" != "$SELF_INSTALL" ]; then
-		if cp -f "$_me" "$SELF_INSTALL" 2>/dev/null; then
-			chmod +x "$SELF_INSTALL"; say "    已装到 $SELF_INSTALL"
-		else
-			warn "    复制到 $SELF_INSTALL 失败，启动项仍指向它（请手动放过去）"
-		fi
+		cp -f "$_me" "$SELF_INSTALL" 2>/dev/null || die "复制到 $SELF_INSTALL 失败（检查 /etc 空间或只读）"
+		say "    已装到 $SELF_INSTALL"
 	fi
-	[ -x "$SELF_INSTALL" ] || chmod +x "$SELF_INSTALL" 2>/dev/null
+	chmod +x "$SELF_INSTALL" 2>/dev/null || true
+	[ -x "$SELF_INSTALL" ] || die "$SELF_INSTALL 不可执行，启动项未安装"
 
 	# ② init.d：开机跑一次（LuCI「系统 → 启动项」里能看见并开关）
-	cat > "$INITHOOK" <<-EOF
+	cat > "$INITHOOK" <<-EOF || die "写 $INITHOOK 失败"
 	#!/bin/sh /etc/rc.common
 	# 由 campus-onekey.sh 生成：开机自动认证
 	START=95
 	STOP=10
 	start() { ( sleep 8; $SELF_INSTALL --auto ) & }
 	EOF
-	chmod +x "$INITHOOK"
+	chmod +x "$INITHOOK" || die "chmod $INITHOOK 失败"
 	[ -x /etc/init.d/campus-onekey ] && /etc/init.d/campus-onekey enable >/dev/null 2>&1
 
 	# ③ hotplug：网口一上线就认证（比等 cron 快）
 	mkdir -p "$HOOKDIR"
-	cat > "$HOOKFILE" <<-EOF
+	cat > "$HOOKFILE" <<-EOF || die "写 $HOOKFILE 失败"
 	#!/bin/sh
 	# 由 campus-onekey.sh 生成：WAN 一上线就认证（最多重试 3 次）
 	[ "\${ACTION:-}" = "ifup" ] || exit 0
+	case "\${INTERFACE:-}" in wan|wan6|wwan|pppoe-wan) ;; *) exit 0 ;; esac
 	( i=1; while [ "\$i" -le 3 ]; do
 		sleep 5
 		$SELF_INSTALL --auto && { logger -t campus-onekey "认证成功（第 \$i 次）"; exit 0; }
 		i=\$((i + 1))
 	  done ) &
 	EOF
-	chmod +x "$HOOKFILE"
+	chmod +x "$HOOKFILE" || die "chmod $HOOKFILE 失败"
 
 	# ④ cron：掉线兜底
 	mkdir -p "$(dirname "$CRONTAB_FILE")"
 	# 去重按"完整命令行"匹配（不要按脚本名匹配：$SELF_INSTALL 的路径可能不含该词）
-	grep -qF "$SELF_INSTALL --auto" "$CRONTAB_FILE" 2>/dev/null || \
-		echo "*/5 * * * * $SELF_INSTALL --auto >/dev/null 2>&1" >> "$CRONTAB_FILE"
+	if ! grep -qF "$SELF_INSTALL --auto" "$CRONTAB_FILE" 2>/dev/null; then
+		echo "*/5 * * * * $SELF_INSTALL --auto >/dev/null 2>&1" >> "$CRONTAB_FILE" \
+			|| die "写 $CRONTAB_FILE 失败"
+	fi
 	[ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1
 	say "    $INITHOOK（开机）+ $HOOKFILE（网口上线）+ cron 每 5 分钟"
 }
 
 autostart_missing() {	# 三个启动项有缺就返回 0（用来判断"要不要补装"）
+	[ -x "$SELF_INSTALL" ] || return 0
 	[ -x "$INITHOOK" ] || return 0
 	[ -x "$HOOKFILE" ] || return 0
 	grep -qF "$SELF_INSTALL --auto" "$CRONTAB_FILE" 2>/dev/null || return 0
@@ -681,7 +835,7 @@ show_log() {	# 只看本脚本留的健康日志
 	info "  WARN 出站 443 不通…   → 新建到 443 的连接被挡（HTTPS 全挂，门户/HTTP 照常）"
 	info "  …443 恢复             → 限制解除的时间点（和隧道起停并排看相关性）"
 	info "  WARN 连接表已用 …%    → 会话表快满：新连接会被丢、已有连接不断"
-	info "  隧道已建立 / 已断开   → EasyTier 的时间线（--pause 做 A/B 时看这个）"
+	info "  隧道已建立 / 已断开   → EasyTier 的时间线（手动暂停隧道做 A/B 时看这个）"
 	info "  时钟与门户差 Ns，已自动按门户校时 / 心跳：在线正常（每小时一条）"
 }
 
@@ -755,7 +909,12 @@ do_logout() {	# 注销门户会话（把残留的"空账号在线"状态清掉�
 	# 与登录同构：user + pass（AES 密文）+ EXTRA_FIELDS。门户的 logoff 一般就吃这一套；
 	# 吃不进去（返回空 ret）时用 LOGOUT_PATH / LOGOUT_EXTRA 覆盖着试，
 	# 接口定义在 $PORTAL/assets/js/raas.js（搜 logoff）。
-	[ -n "${CAMPUS_PASS:-}" ] && pw="$(raas_encode "$CAMPUS_PASS" 2>/dev/null || true)"
+	if [ -n "${CAMPUS_PASS:-}" ]; then
+		if raas_encode "$CAMPUS_PASS" > "$COOKIE.pass" 2>/dev/null; then
+			pw="$(cat "$COOKIE.pass" 2>/dev/null)"
+		fi
+		rm -f "$COOKIE.pass"
+	fi
 	if [ "$DRY_RUN" = 1 ]; then
 		printf '    [dry-run] GET %s/（拿 cookie）\n' "$PORTAL"
 		printf '    [dry-run] POST %s（user=%s pass=%s + %s）\n' "$url" "${CAMPUS_USER:-?}" "${pw:+<AES>}" "${LOGOUT_EXTRA:-$EXTRA_FIELDS}"
@@ -789,9 +948,14 @@ do_logout() {	# 注销门户会话（把残留的"空账号在线"状态清掉�
 #   换掉 WAN MAC → 网关眼里是新设备 → 通常会重新分配 IP、重新认证，限制档位大概率消失。
 # 副作用：会占一个"设备数"名额（旧记录过期后释放）；网关/交换机侧可能有 MAC 绑定告警。
 # 回退：sh 本脚本 --mac-restore
+wan_dev() {	# WAN 的设备名（可能和逻辑接口名不同，例如 wwan）
+	_d="$(uci -q get network.wan.device 2>/dev/null)"
+	[ -n "$_d" ] || _d=wan
+	printf '%s' "$_d"
+}
 mac_info() {	# 输出 "<uci段名> <当前MAC> <当前IP>"
 	local sec dev mac ip4
-	dev="$(uci -q get network.wan.device 2>/dev/null)"; [ -n "$dev" ] || dev=wan
+	dev="$(wan_dev)"
 	sec="$(uci show network 2>/dev/null | sed -n "s/^network\.\([A-Za-z0-9_]*\)\.device='$dev'\$/\1/p" | head -1)"
 	[ -n "$sec" ] || sec=wan
 	mac="$(cat /sys/class/net/$dev/address 2>/dev/null)"
@@ -800,7 +964,7 @@ mac_info() {	# 输出 "<uci段名> <当前MAC> <当前IP>"
 }
 # 硬件（永久）MAC：`ip link` 的 permaddr 或 ethtool -P；读不到返回空
 perm_mac() {
-	local d="${1:-wan}" m
+	local d="${1:-$(wan_dev)}" m
 	m="$(ip -d link show dev "$d" 2>/dev/null | sed -n 's/.*permaddr \([0-9a-fA-F:]\{17\}\).*/\1/p' | head -1)"
 	[ -n "$m" ] || m="$(ip link show dev "$d" 2>/dev/null | sed -n 's/.*permaddr \([0-9a-fA-F:]\{17\}\).*/\1/p' | head -1)"
 	[ -n "$m" ] || m="$(ethtool -P "$d" 2>/dev/null | awk '{print $3}')"
@@ -809,7 +973,7 @@ perm_mac() {
 		*) : ;;
 	esac
 }
-wan_has_ip() { ip -4 -o addr show dev wan 2>/dev/null | grep -q 'inet '; }
+wan_has_ip() { ip -4 -o addr show dev "${1:-$(wan_dev)}" 2>/dev/null | grep -q 'inet '; }
 portal_reach() { curl -s -m 5 -o /dev/null "$PORTAL/" 2>/dev/null; }
 # 连接表用量：输出 "<count> <max> <pct>"；读不到返回非 0。
 # 为什么盯它：**"新连接失败、已有连接不断"是连接表满了的经典特征**
@@ -826,10 +990,11 @@ ct_stat() {
 }
 
 do_new_mac() {
-	local sec mac ip4 new="${1:-}" i pm
+	local sec mac ip4 new="${1:-}" i pm dev
 	# ★ 必须先取 $1 再 set --，否则 set -- 会把函数自己的参数覆盖掉（踩过）
 	set -- $(mac_info); sec="$1"; mac="$2"; ip4="$3"
-	pm="$(perm_mac wan)"
+	dev="$(wan_dev)"
+	pm="$(perm_mac "$dev")"
 	info "换 WAN MAC（段 network.$sec，当前 MAC=$mac IP=$ip4${pm:+，硬件 MAC=$pm}）"
 	warn "    注意：这会重新申请 IP。若校园网做了 MAC 绑定/端口安全，可能拿不到地址甚至断网；"
 	warn "          本脚本两步都失败会自动回退（回退不掉就 reboot）"
@@ -852,24 +1017,25 @@ do_new_mac() {
 	say "    （任何一步不对劲都会**自动回退**；回退不掉就 reboot，驱动 probe 时会用硬件 MAC）"
 	run uci set "network.$sec.macaddr=$new"
 	run uci commit network
-	run ifdown wan
+	run ifdown "$sec"
 	run sleep 3
-	run ifup wan
+	run ifup "$sec"
 	[ "$DRY_RUN" = 1 ] && return 0
 	# ★ 安全网 1：等 DHCP 给地址。等不到说明这个 MAC 被拒/端口安全 → 立刻回退，
 	#   绝不把它留在"没地址"的状态（实测踩过：换完 MAC 直接断网）。
+	#   校园 DHCP 有时要 60 秒以上，给 90 秒再判失败。
 	i=0
-	while [ "$i" -lt 10 ]; do sleep 4; wan_has_ip && break; i=$((i + 1)); done
-	if ! wan_has_ip; then
+	while [ "$i" -lt 23 ]; do sleep 4; wan_has_ip "$dev" && break; i=$((i + 1)); done
+	if ! wan_has_ip "$dev"; then
 		warn "    换 MAC 后等不到 IP（$((i * 4)) 秒）—— **自动回退**"
-		do_mac_restore
+		do_mac_restore "$sec" "$dev"
 		return 1
 	fi
-	say "    新 IP：$(ip -4 -o addr show dev wan | awk '{print $4}' | head -1)"
+	say "    新 IP：$(ip -4 -o addr show dev "$dev" 2>/dev/null | awk '{print $4}' | head -1)"
 	# ★ 安全网 2：连门户都打不开 = 这个 MAC 上不了网（MAC 绑定/MAC 认证）→ 回退
 	if ! portal_reach; then
 		warn "    拿到 IP 但门户 ping 不通 —— 这个 MAC 大概率被网关拒（MAC 绑定/认证）→ **自动回退**"
-		do_mac_restore
+		do_mac_restore "$sec" "$dev"
 		return 1
 	fi
 	do_login >/dev/null 2>&1 || warn "    自动认证没成功，稍后 cron 会兜（或手动 --auth）"
@@ -879,20 +1045,21 @@ do_new_mac() {
 	say "    回退：sh $0 --mac-restore"
 }
 do_mac_restore() {
-	local sec pm i
-	sec="$(mac_info)"; sec="${sec%% *}"
-	pm="$(perm_mac wan)"
+	local sec="${1:-}" pm i dev
+	dev="${2:-$(wan_dev)}"
+	[ -n "$sec" ] || { sec="$(mac_info)"; sec="${sec%% *}"; }
+	pm="$(perm_mac "$dev")"
 	info "去掉 WAN MAC 覆盖（network.$sec.macaddr）${pm:+，并显式设回硬件 MAC $pm}"
 	run uci -q delete "network.$sec.macaddr"
 	# 光删 uci 选项，网卡上可能还挂着改过的 MAC（内核不会自动退回 permaddr），
 	# 所以读到 permaddr 就显式设回去 —— 这样不用重启也能复原。
 	[ -n "$pm" ] && run uci set "network.$sec.macaddr=$pm"
 	run uci commit network
-	run ifdown wan; run sleep 3; run ifup wan
+	run ifdown "$sec"; run sleep 3; run ifup "$sec"
 	[ "$DRY_RUN" = 1 ] && return 0
 	i=0
-	while [ "$i" -lt 8 ]; do sleep 4; wan_has_ip && break; i=$((i + 1)); done
-	if wan_has_ip; then
+	while [ "$i" -lt 15 ]; do sleep 4; wan_has_ip "$dev" && break; i=$((i + 1)); done
+	if wan_has_ip "$dev"; then
 		say "    已恢复：$(mac_info)"
 	else
 		warn "    还没拿到 IP。下一步：reboot（驱动 probe 时会用硬件 MAC 重新初始化网卡）"
@@ -904,9 +1071,13 @@ uninstall_autostart() {
 	info "卸载启动项"
 	[ -x /etc/init.d/campus-onekey ] && { /etc/init.d/campus-onekey disable >/dev/null 2>&1; /etc/init.d/campus-onekey stop >/dev/null 2>&1; }
 	run rm -f "$INITHOOK" "$HOOKFILE"
+	if [ "$DRY_RUN" != 1 ] && { [ -e "$INITHOOK" ] || [ -e "$HOOKFILE" ]; }; then
+		warn "部分启动项文件删除失败（权限或只读文件系统）"
+	fi
 	# 只删我们加的那一行（按完整命令行匹配，别误删别人的 cron）
 	if [ -f "$CRONTAB_FILE" ] && grep -qF "$SELF_INSTALL --auto" "$CRONTAB_FILE"; then
-		run sh -c "grep -vF '$SELF_INSTALL --auto' '$CRONTAB_FILE' > '$CRONTAB_FILE.tmp' && mv '$CRONTAB_FILE.tmp' '$CRONTAB_FILE'"
+		run sh -c "grep -vF '$SELF_INSTALL --auto' '$CRONTAB_FILE' > '$CRONTAB_FILE.tmp' && mv '$CRONTAB_FILE.tmp' '$CRONTAB_FILE'" \
+			|| warn "cron 行删除失败（$CRONTAB_FILE）"
 	fi
 	[ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1
 	say "    已移除 init.d / hotplug / cron 三项（账号密码仍在 $CONF）"
@@ -949,10 +1120,19 @@ clock_sync() {	# 按门户时间校时，并写回硬件时钟。成功 0；拿�
 	info "门户说：$(portal_date)"
 	info "本机说：$(date '+%F %T %Z')"
 	# 门户给的是 GMT，必须带 -u，否则会被当成本地时间（差一个时区）
-	run date -u -s "$iso"
-	[ -x /sbin/hwclock ] && run hwclock -w
+	if ! run date -u -s "$iso"; then
+		warn "    校时失败（date -s 返回非 0）：权限不足，或 busybox date 不支持这个格式"
+		return 1
+	fi
+	if [ -x /sbin/hwclock ]; then
+		run hwclock -w || warn "    hwclock -w 失败（可能没有 RTC）"
+	fi
 	[ "$DRY_RUN" = 1 ] && return 0
-	say "    已校时（UTC $iso），硬件时钟也写了"
+	if [ -x /sbin/hwclock ]; then
+		say "    已校时（UTC $iso），硬件时钟也写了"
+	else
+		say "    已校时（UTC $iso）；没有 hwclock，未写硬件时钟"
+	fi
 	sk="$(clock_skew 2>/dev/null)" || sk=''
 	[ -n "$sk" ] && say "    现在与门户相差 ${sk}s（±60 秒内都算正常）"
 	return 0
@@ -970,7 +1150,7 @@ clock_auto() {
 		if clock_sync; then
 			log "时钟与门户差 ${sk}s，已自动按门户校时"
 		else
-			log "WARN 时钟与门户差 ${sk}s，且拿不到门户时间（$PORTAL 打不开？）"
+			log "WARN 时钟与门户差 ${sk}s，但校时失败（门户时间拿不到，或 date -s 失败）"
 		fi
 	else
 		log "WARN 本机时钟与门户差 ${sk}s（NTP 同步不上？应急校时：sh $SELF_INSTALL --clock）"
@@ -1005,7 +1185,11 @@ dns_set() {	# $1 = fallback | adgh
 	[ "$DRY_RUN" = 1 ] && return 0
 	sleep 3
 	if dns_ok; then
-		say "    域名解析已恢复 ✅"
+		if [ "$DNS_UNKNOWN" = 1 ]; then
+			say "    没有 nslookup/dig/host，无法确认解析是否恢复（用客户端试）"
+		else
+			say "    域名解析已恢复 ✅"
+		fi
 		[ "$1" = fallback ] && say "    注意：现在是明文 DNS 直连公网；AGH 修好后跑 sh $0 --dns-adgh 切回去"
 	else
 		warn "    还是解析不了 —— 看 logread | grep -iE 'dnsmasq|adguard'；也可能是 AGH 没起来"
@@ -1016,11 +1200,13 @@ show_status() {
 	local sk skabs ps pl pa psl rest
 	# 四行分开报：这四种故障体感都是"上不了网"，但修法完全不同（见 §8.1）
 	printf '外网(按IP): '; if tcp_out; then echo "通 ✅（HTTP $TCP_CODE）"; else echo '不通 ❌'; fi
-	printf '域名解析 : '; if dns_ok; then echo '正常 ✅'; else echo '不通 ❌ → dnsmasq/AdGuardHome 挂了，可用 --dns-fallback 应急'; fi
+	printf '域名解析 : '; if dns_ok; then
+		if [ "$DNS_UNKNOWN" = 1 ]; then echo '无法检测（没有 nslookup/dig/host）'; else echo '正常 ✅'; fi
+	else echo '不通 ❌ → dnsmasq/AdGuardHome 挂了，可用 --dns-fallback 应急'; fi
 	if https_out; then
 		printf '出站 443 : 通 ✅\n'
 	else
-		printf '出站 443 : 不通 ❌（HTTPS 全挂；门户/HTTP/DNS 照常，别误判成认证掉了）\n'
+		printf '出站 443 : 不通 ❌（%s；HTTPS 全挂；门户/HTTP/DNS 照常，别误判成认证掉了）\n' "${HTTPS_ERR:-unknown}"
 		printf '           线路档位：%s\n' "$(line_tier)"
 		printf '           先别急着重认证（实测无效）；用 --probe 看全貌、--relogin 清残留会话\n'
 	fi
@@ -1030,7 +1216,7 @@ show_status() {
 	# 真正的判据是"实测哪些端口能出去"，也就是上面的「线路档位」和 --probe。
 	ps="$(portal_state 2>/dev/null)" || ps=''
 	if [ -z "$ps" ]; then
-		printf '门户会话 : 查不到（$PORTAL 打不开？）\n'
+		printf '门户会话 : 查不到（%s 打不开？）\n' "$PORTAL"
 	else
 		pl="${ps%%|*}"; rest="${ps#*|}"; pa="${rest%%|*}"; psl="${rest#*|}"
 		printf '门户会话 : logined=%s acct=%s session=%s' "$pl" "${pa:-（空）}" "$psl"
@@ -1065,6 +1251,15 @@ show_status() {
 	else
 		# 没凭据＝掉线后 cron 没法自动重认证（刷完机跑 full 时网正好通就会这样）
 		printf '账号     : （空）⚠️ 没存凭据 → 掉线后不会自动重认证，跑一次：sh %s --auth 账号 密码\n' "$SELF_INSTALL"
+	fi
+	if [ -f "$AUTH_FAIL_MARK" ]; then
+		_fm="$(cat "$AUTH_FAIL_MARK" 2>/dev/null || echo 0)"
+		case "$_fm" in ''|*[!0-9]*) _fm=0 ;; esac
+		_now="$(date +%s)"
+		if [ "$_fm" -gt 0 ] && [ $((_now - _fm)) -lt 1800 ]; then
+			printf '认证退避 : 上次被拒，约 %s 分钟后重试（删 %s 可立即重试）\n' \
+				"$(( (1800 - (_now - _fm) + 59) / 60 ))" "$AUTH_FAIL_MARK"
+		fi
 	fi
 	printf '启动项   : init.d=%s hotplug=%s cron=%s\n' \
 		"$([ -x "$INITHOOK" ] && echo 有 || echo 无)" \
@@ -1115,7 +1310,7 @@ case "${1:-}" in
 --new-mac)   MODE="newmac"; shift ;;
 --mac-restore) MODE="macrestore"; shift ;;
 --uninstall) MODE="uninstall"; shift ;;
---help|-h)   sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+--help|-h)   sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 --*)          die "未知参数：$1（试试 --help）" ;;
 esac
 # 账号密码的位置随用法而变：`… 账号 密码` 与 `… --auth 账号 密码` 都要能用
@@ -1126,13 +1321,61 @@ full|auth)
 	;;
 esac
 
+# 先做权限/依赖检查，再分派。旧版把检查放在分派之后，
+# 导致 --install/--ttl/--new-mac 等早退模式在非 root 下也会"成功"。
+case "$MODE" in
+	status|log|probe) ;;
+	*)
+		[ "$DRY_RUN" = 1 ] || [ "$(id -u)" = 0 ] || die "请用 root 运行（要改防火墙和系统配置）"
+		[ "$DRY_RUN" = 1 ] || has uci || die "找不到 uci —— 这个脚本要在 OpenWrt 路由器上跑"
+		;;
+esac
+case "$MODE" in
+	full|auth|auto|status|probe|clock|logout|relogin|newmac)
+		has curl || die "找不到 curl —— 先 opkg install curl" ;;
+esac
+case "$PORTAL" in http://*|https://*) ;; *) die "门户地址看着不对：$PORTAL" ;; esac
+
+# 入口互斥：开机时 init.d / hotplug / cron 可能同时触发，共用 cookie 会互删会话
+LOCK_HELD=0
+_lock() {
+	mkdir -p "$(dirname "$LOCKDIR")" 2>/dev/null
+	if mkdir "$LOCKDIR" 2>/dev/null; then
+		: > "$LOCKDIR/ts" 2>/dev/null
+		LOCK_HELD=1; return 0
+	fi
+	# 超过 10 分钟的锁视为进程被 kill 后的残留（不依赖 find -mmin）
+	if [ -f "$LOCKDIR/ts" ]; then
+		_t="$(cat "$LOCKDIR/ts" 2>/dev/null || echo 0)"
+		case "$_t" in ''|*[!0-9]*) _t=0 ;; esac
+		_n="$(date +%s)"
+		if [ "$_t" -gt 0 ] && [ $((_n - _t)) -gt 600 ]; then
+			rm -rf "$LOCKDIR"
+			if mkdir "$LOCKDIR" 2>/dev/null; then
+				: > "$LOCKDIR/ts" 2>/dev/null
+				LOCK_HELD=1; return 0
+			fi
+		fi
+	fi
+	return 1
+}
+_cleanup() {
+	rm -f "$COOKIE" "$COOKIE.pass" 2>/dev/null
+	[ "$LOCK_HELD" = 1 ] && rm -rf "$LOCKDIR" 2>/dev/null
+}
+trap _cleanup EXIT INT TERM HUP
+case "$MODE" in
+	status|log|probe) ;;
+	*) _lock || { warn "另一个 campus-onekey 正在运行，跳过本次"; exit 0; } ;;
+esac
+
 case "$MODE" in
 status)    show_status; exit 0 ;;
 install)   install_autostart; exit 0 ;;
 ttl)       info "只刷新 TTL 规则（不动 UA-Mask / 不认证）"; setup_ttl; exit 0 ;;
 dnsfb)     dns_set fallback; exit 0 ;;
 dnsagh)    dns_set adgh; exit 0 ;;
-clock)     clock_sync || die "拿不到门户时间 —— $PORTAL 打不开？"; exit 0 ;;
+clock)     clock_sync || die "校时失败 —— 门户时间拿不到，或 date -s 失败" ; exit 0 ;;
 log)       show_log "${1:-}"; exit 0 ;;
 probe)     probe_out; exit 0 ;;
 newmac)    do_new_mac "${1:-}"; exit 0 ;;
@@ -1144,18 +1387,13 @@ relogin)
 	do_logout || warn "注销没成功——仍旧继续尝试登录（有些门户允许直接覆盖会话）"
 	sleep 2
 	info "② 再重新认证"
-	do_login || { warn "重登没成功，看上面的输出"; exit 1; }
+	if do_login; then rm -f "$AUTH_FAIL_MARK"; else warn "重登没成功，看上面的输出"; exit 1; fi
 	ps="$(portal_state 2>/dev/null)" || ps=''
 	[ -n "$ps" ] && say "    现在门户状态：logined=${ps%%|*} acct=$(printf '%s' "${ps#*|}" | cut -d'|' -f1)"
 	exit 0
 	;;
 uninstall) uninstall_autostart; exit 0 ;;
 esac
-
-[ "$DRY_RUN" = 1 ] || [ "$(id -u)" = 0 ] || die "请用 root 运行（要改防火墙和系统配置）"
-[ "$DRY_RUN" = 1 ] || has uci || die "找不到 uci —— 这个脚本要在 OpenWrt 路由器上跑"
-
-case "$PORTAL" in http://*|https://*) ;; *) die "门户地址看着不对：$PORTAL" ;; esac
 
 case "$MODE" in
 auto)
@@ -1164,23 +1402,33 @@ auto)
 	# 否则掉线/重启后再没人自动认证，也不会自动校时。
 	if autostart_missing; then
 		log "检测到启动项缺失，自动补装"
-		install_autostart
+		# 子 shell 包一层：补装失败（die）不要挡住本次认证
+		( install_autostart ) || log "启动项补装失败（继续认证）"
 	fi
 	if online; then
+		rm -f "$AUTH_FAIL_MARK"
 		# 顺手留个健康状况的痕迹（只记不改，脚本不偷偷动 DNS 配置）。
 		# ★ 只在"状态变化"时写：logd 的环形缓冲很小（默认 16 KB），每 5 分钟刷一遍
 		#   会把别的日志一起冲掉 —— 实测踩过：443 红了几小时，--log 里却什么都看不到。
-		if dns_ok; then log_state_clear dns "域名解析恢复"
+		if dns_ok; then
+			[ "$DNS_UNKNOWN" = 1 ] || log_state_clear dns "域名解析恢复"
 		else log_state dns "WARN 域名解析不通（本机 dnsmasq/AdGuardHome 挂了？应急：sh $SELF_INSTALL --dns-fallback），但按 IP 的外网是通的"; fi
-		if https_out; then log_state_clear https "出站 443 恢复（HTTPS 又能用了）"
-		else log_state https "WARN 出站 443 不通（HTTPS 全挂；门户/HTTP/DNS 照常）—— 校园网侧封锁本线路的出站 443，不是认证问题，等它自己恢复"; fi
+		if https_out; then
+			log_state_clear https "出站 443 恢复（HTTPS 又能用了）"
+		else
+			case "$HTTPS_ERR" in
+				tls) log_state https "WARN 出站 443 端口可达但 TLS 握手失败（不是被丢包；查证书/中间盒）" ;;
+				*)   log_state https "WARN 出站 443 不通（${HTTPS_ERR:-unknown}；HTTPS 全挂；门户/HTTP/DNS 照常）—— 校园网侧封锁本线路的出站 443，不是认证问题，等它自己恢复" ;;
+			esac
+		fi
 		# 连接表用量：>80% 记一次（新连接失败/已有连接不断的头号嫌疑）
 		_ctp="$(ct_stat 2>/dev/null)" || _ctp=''
 		case "${_ctp:-}" in
 			'') : ;;
 			*) _pct="${_ctp##* }"
+			   _ct_n="${_ctp%% *}"; _ct_r="${_ctp#* }"; _ct_m="${_ct_r%% *}"
 			   if [ "$_pct" -gt 80 ] 2>/dev/null; then
-				log_state ct "WARN 连接表已用 ${_pct}%（${_ctp%% *}/${_ctp#* }）—— 新连接会被丢，检查谁在占：awk '{print \$4}' /proc/net/nf_conntrack | sort | uniq -c | sort -rn | head"
+				log_state ct "WARN 连接表已用 ${_pct}%（${_ct_n}/${_ct_m}）—— 新连接会被丢，检查谁在占：awk '{print \$4}' /proc/net/nf_conntrack | sort | uniq -c | sort -rn | head"
 			   else
 				log_state_clear ct "连接表恢复正常（新连接又能建了）"
 			   fi ;;
@@ -1201,10 +1449,28 @@ auto)
 		fi
 		exit 0
 	fi
-	do_login || exit 1
+	# 没在线才看退避：网络恢复后不该被旧的失败标记挡住
+	if [ -f "$AUTH_FAIL_MARK" ]; then
+		_last="$(cat "$AUTH_FAIL_MARK" 2>/dev/null || echo 0)"
+		case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+		_now="$(date +%s)"
+		if [ "$_last" -gt 0 ] && [ $((_now - _last)) -lt 1800 ]; then
+			log "认证被拒后退避中（$(( (1800 - (_now - _last)) / 60 )) 分钟），跳过本次"
+			exit 0
+		fi
+	fi
+	if do_login; then
+		rm -f "$AUTH_FAIL_MARK"
+	else
+		if [ "$AUTH_FATAL" = 1 ]; then
+			date +%s > "$AUTH_FAIL_MARK" 2>/dev/null || true
+			log "认证被拒（账号/密码/策略），30 分钟内不再重试"
+		fi
+		exit 1
+	fi
 	;;
 auth)
-	do_login || exit 1
+	if do_login; then rm -f "$AUTH_FAIL_MARK"; else exit 1; fi
 	;;
 full)
 	read_conf
@@ -1212,6 +1478,7 @@ full)
 	[ "$SKIP_DISGUISE" = 1 ] && say "（SKIP_DISGUISE=1：跳过伪装）" || setup_disguise
 	if online; then
 		say "外网已通，跳过认证"
+		rm -f "$AUTH_FAIL_MARK"
 		# ★ 跳过认证也要把账号密码存下来：否则一旦掉线，cron --auto 没凭据可用，
 		#   只能手动再跑一次（实测踩过：刷完机跑 full 时网正好是通的 → 账号一直是空的，
 		#   而 status 里那行"账号"为空就是它的信号）。
@@ -1231,6 +1498,7 @@ full)
 		fi
 	else
 		do_login; _rc=$?
+		if [ "$_rc" = 0 ]; then rm -f "$AUTH_FAIL_MARK"; fi
 		if [ "$_rc" != 0 ]; then
 			if [ "$AUTH_FATAL" = 1 ]; then
 				warn "认证被门户拒绝（账号密码或门户策略问题）—— 先不装启动项，免得每 5 分钟拿错密码去撞门户"

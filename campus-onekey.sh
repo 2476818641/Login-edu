@@ -26,6 +26,7 @@
 #   sh campus-onekey.sh 账号 密码            # 全流程（幂等：已在线也会把伪装配置和启动项补齐）
 #   sh campus-onekey.sh                      # 交互式问账号密码
 #   sh campus-onekey.sh --status             # 状态：外网通不通、启动项装没装、伪装开着没
+#   sh campus-onekey.sh --ua                 # 检查/修复 UA-Mask 配置与服务（UA 没改过就用默认 Chrome）
 #   sh campus-onekey.sh --auth               # 只认证（不动伪装配置、不装启动项）
 #   sh campus-onekey.sh --install            # 只装启动项（开机 / 网口上线 / cron 每 5 分钟）
 #   sh campus-onekey.sh --ttl                # 只刷新 TTL 规则（补齐入站 TCP/UDP 修复）
@@ -93,6 +94,12 @@ CLOCK_AUTO="${CLOCK_AUTO:-1}"
 AUTH_FATAL=0
 RAAS_ERR=''	# raas_encode 的失败原因（必须在当前 shell 里调用才能读到）
 UA_STR="${UA_STR:-}"
+# 路由器自己发起的 curl 也用浏览器 UA：网关用 UA 认设备，
+# curl 默认的 "curl/8.x" 会让同一个 WAN MAC 多出一个身份（多算一台设备）。
+CURL_UA="${CURL_UA:-${UA_STR:-$UAMASK_UA_DEFAULT}}"
+EFFECTIVE_UA=''	# setup_disguise/ensure_uamask 实际选定的 UA（供 TTL 人设使用）
+UA_AUTO="${UA_AUTO:-1}"	# 1=--auto 每次启动检查/修复 UA-Mask 配置与服务
+UAMASK_FAIL_MARK="${UAMASK_FAIL_MARK:-/tmp/.campus-uamask-fail}"	# 起不来时的退避标记
 UA_MODE="${UA_MODE:-regex}"				# regex（正表，推荐）/ all（全量）
 UA_WHITELIST="${UA_WHITELIST:-}"
 TTL_VALUE="${TTL_VALUE:-}"
@@ -150,7 +157,7 @@ DNS_UNKNOWN=0	# 1=没有 nslookup/dig/host，dns_ok 无法判断（不要据此�
 tcp_out() {
 	local u c
 	for u in $ONLINE_IP_PROBES; do
-		c="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$u" 2>/dev/null)"
+		c="$(curl -s -m 5 -A "$CURL_UA" -o /dev/null -w '%{http_code}' "$u" 2>/dev/null)"
 		case "$c" in ''|000) : ;; *) TCP_CODE="$c"; return 0 ;; esac
 	done
 	return 1
@@ -200,7 +207,7 @@ et_tun() {	# 隧道网卡名：优先 uci，其次 /etc/easytier/config.toml 里
 }
 probe_one() {	# probe_one <host> <port> → open | block | unknown
 	local r rc
-	r="$(curl -s -m 4 -o /dev/null -w '%{errormsg}' "http://$1:$2/" 2>/dev/null)"; rc=$?
+	r="$(curl -s -m 4 -A "$CURL_UA" -o /dev/null -w '%{errormsg}' "http://$1:$2/" 2>/dev/null)"; rc=$?
 	if [ -n "$r" ]; then
 		case "$r" in
 			*efused*)     printf 'open' ;;	# 对面没服务，但包出去了
@@ -241,7 +248,7 @@ line_tier() {
 https_out() {
 	local c rc
 	HTTPS_ERR=''
-	c="$(curl -sk -m 6 -o /dev/null -w '%{http_code}' "https://${PROBE_HOST:-223.5.5.5}/" 2>/dev/null)"; rc=$?
+	c="$(curl -sk -m 6 -A "$CURL_UA" -o /dev/null -w '%{http_code}' "https://${PROBE_HOST:-223.5.5.5}/" 2>/dev/null)"; rc=$?
 	case "$rc" in
 		28)      HTTPS_ERR='timeout'; return 1 ;;
 		7)       HTTPS_ERR='refused'; return 1 ;;
@@ -257,20 +264,20 @@ https_out() {
 #   诊断"TCP 出不出得去"仍用 tcp_out，两件事别混。
 online() {
 	ONLINE_REASON=''
-	_c="$(curl -s -m 6 -o /dev/null -w '%{http_code}' "$CHECK_URL" 2>/dev/null)"
+	_c="$(curl -s -m 6 -A "$CURL_UA" -o /dev/null -w '%{http_code}' "$CHECK_URL" 2>/dev/null)"
 	[ "$_c" = 204 ] && { ONLINE_REASON='204'; return 0; }
 
 	_ph="${PORTAL#*://}"; _ph="${_ph%%/*}"
 	for _u in $ONLINE_IP_PROBES; do
-		_c="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$_u" 2>/dev/null)"
+		_c="$(curl -s -m 5 -A "$CURL_UA" -o /dev/null -w '%{http_code}' "$_u" 2>/dev/null)"
 		case "$_c" in ''|000) continue ;; esac
-		_loc="$(curl -s -m 5 -o /dev/null -w '%{redirect_url}' "$_u" 2>/dev/null)"
+		_loc="$(curl -s -m 5 -A "$CURL_UA" -o /dev/null -w '%{redirect_url}' "$_u" 2>/dev/null)"
 		case "$_loc" in
 			*"$_ph"*) ONLINE_REASON='portal-redirect'; continue ;;
 		esac
 		case "$_c" in
 			2??)
-				_body="$(curl -s -m 5 "$_u" 2>/dev/null | head -c 400)"
+				_body="$(curl -s -m 5 -A "$CURL_UA" "$_u" 2>/dev/null | head -c 400)"
 				case "$_body" in
 					*'<form'*|*'login'*|*'登录'*|*'认证'*) ONLINE_REASON='portal-page'; continue ;;
 				esac
@@ -433,6 +440,146 @@ ua_persona_ttl() {	# 按 UA 人设给 TTL：Windows=128，Android/Linux/macOS=64
 	esac
 }
 
+# 选择 UAmask 实际使用的 UA：
+#   1) UA_STR 显式指定 → 用它；
+#   2) UAmask 里已经有合法的浏览器 UA（Mozilla/...）→ 视为“用户改过”，保留；
+#   3) 空、FFF、curl、随便写的占位值 → 回退脚本默认的 Windows Chrome。
+pick_ua() {
+	if [ -n "${UA_STR:-}" ]; then printf '%s' "$UA_STR"; return 0; fi
+	_cur_ua="$(uget UAmask.main.ua)"
+	case "$_cur_ua" in
+		Mozilla/*) printf '%s' "$_cur_ua" ;;
+		*)         printf '%s' "$UAMASK_UA_DEFAULT" ;;
+	esac
+}
+
+# UAmask 的服务检查（进程 / 监听端口 / nft 规则），只读
+uamask_port() {
+	_up="$(uget UAmask.main.port)"
+	case "$_up" in ''|*[!0-9]*) _up=12032 ;; esac
+	printf '%s' "$_up"
+}
+uamask_bin() {	# UAmask 二进制路径（编译进固件时不一定在 /usr/bin）
+	if has UAmask; then command -v UAmask; return 0; fi
+	for _b in /usr/bin/UAmask /usr/sbin/UAmask /sbin/UAmask; do
+		[ -x "$_b" ] && { printf '%s' "$_b"; return 0; }
+	done
+	return 1
+}
+uamask_pid() {
+	_p="$(pidof UAmask 2>/dev/null)" && [ -n "$_p" ] && { printf '%s' "$_p"; return 0; }
+	_p="$(pgrep -f '/UAmask' 2>/dev/null)" && [ -n "$_p" ] && { printf '%s' "$_p"; return 0; }
+	_p="$(ps 2>/dev/null | awk '/[U]Amask/ {print $1; exit}')"
+	[ -n "$_p" ] && { printf '%s' "$_p"; return 0; }
+	return 1
+}
+uamask_listening() {
+	_up="$(uamask_port)"
+	netstat -lntp 2>/dev/null | grep -q "[:.]${_up}[[:space:]]" && return 0
+	ss -lntp 2>/dev/null | grep -q "[:.]${_up}[[:space:]]" && return 0
+	_hex="$(printf '%04X' "$_up" 2>/dev/null)"
+	[ -n "$_hex" ] && grep -qi ":${_hex}[[:space:]]" /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0
+	return 1
+}
+uamask_nft_ok() {
+	nft list ruleset 2>/dev/null | grep -qi uamask
+}
+uamask_ok() {
+	uamask_pid >/dev/null 2>&1 || return 1
+	uamask_listening || return 1
+	return 0
+}
+uamask_diag() {
+	_dp='否'; uamask_pid >/dev/null 2>&1 && _dp='是'
+	_dl='否'; uamask_listening && _dl='是'
+	_dn='否'; uamask_nft_ok && _dn='是'
+	printf '进程=%s 端口=%s nft=%s' "$_dp" "$_dl" "$_dn"
+}
+uamask_wait() {	# 重启后最多等 8 秒，避免 UAmask 稍慢就误判失败
+	_i=0
+	while [ "$_i" -lt 8 ]; do
+		uamask_ok && return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
+# 每次启动（--auto / full / --ua）先调用：
+#   · UA 为空/FFF/curl 等占位值 → 改成默认 Chrome（用户自己填的 Mozilla UA 保留）
+#   · 关键选项缺失 → 补默认值；enabled=0 → 置 1
+#   · 配置有变化或进程/端口/nft 不正常 → 重启一次；仍失败则 30 分钟退避，避免每 5 分钟重启
+ensure_uamask() {
+	if [ "$DRY_RUN" = 1 ]; then
+		say "    [dry-run] 检查 UA-Mask：UA=$(printf '%.48s' "$(pick_ua)")"
+		return 0
+	fi
+	has uci || return 0
+	if [ -z "$(uget UAmask.enabled.enabled)" ] && ! uamask_bin >/dev/null 2>&1; then
+		return 0
+	fi
+
+	_want="$(pick_ua)"
+	_changed=0
+	if [ "$(uget UAmask.main.ua)" != "$_want" ]; then
+		uci set UAmask.main.ua="$_want" && _changed=1
+	fi
+	[ -n "$(uget UAmask.main.match_mode)" ] || { uci set UAmask.main.match_mode='regex' && _changed=1; }
+	[ -n "$(uget UAmask.main.replace_method)" ] || { uci set UAmask.main.replace_method='full' && _changed=1; }
+	[ -n "$(uget UAmask.main.ua_regex)" ] || { uci set UAmask.main.ua_regex="$UAMASK_REGEX" && _changed=1; }
+	[ "$(uget UAmask.main.Firewall_drop_on_match)" = 0 ] || { uci set UAmask.main.Firewall_drop_on_match='0' && _changed=1; }
+	[ "$(uget UAmask.enabled.enabled)" = 1 ] || { uci set UAmask.enabled.enabled='1' && _changed=1; }
+
+	if [ "$_changed" = 1 ]; then
+		uci commit UAmask 2>/dev/null || warn "    uci commit UAmask 失败"
+		log "UA-Mask 配置修正（UA=$(printf '%.60s' "$_want")），重启服务"
+		/etc/init.d/UAmask restart >/dev/null 2>&1
+		uamask_wait || true
+		rm -f "$UAMASK_FAIL_MARK"
+	fi
+	EFFECTIVE_UA="$_want"
+	# UA 人设和 TTL 规则要对得上：Windows UA=128，Android/iOS/Linux=64
+	if [ -f "$TTL_FILE" ]; then
+		_u_ttl="$(sed -n 's/.*ip ttl set \([0-9]*\).*/\1/p' "$TTL_FILE" 2>/dev/null | head -1)"
+		_u_want="$(ua_persona_ttl "$_want")"
+		if [ -n "$_u_ttl" ] && [ "$_u_ttl" != "$_u_want" ]; then
+			warn "    UA 人设对应 TTL=$_u_want，但当前 TTL 规则=$_u_ttl；跑一次 --ttl（或 full）对齐"
+		fi
+	fi
+
+	if uamask_ok; then
+		rm -f "$UAMASK_FAIL_MARK"
+		if uamask_nft_ok; then
+			log_state_clear uamask "UAmask 正常服务"
+		else
+			log_state uamask "WARN UAmask 在跑但 nft 规则没看到，UA 可能没生效"
+		fi
+		return 0
+	fi
+
+	# 失败退避：30 分钟内不反复重启（进程被 kill 的情况仍会在下一次 --auto 检查）
+	_now="$(date +%s)"
+	_last="$(cat "$UAMASK_FAIL_MARK" 2>/dev/null || echo 0)"
+	case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+	if [ "$_last" -gt 0 ] && [ $((_now - _last)) -lt 1800 ]; then
+		return 1
+	fi
+
+	warn "    UAmask 未正常服务（$(uamask_diag)），尝试重启一次"
+	/etc/init.d/UAmask restart >/dev/null 2>&1
+	uamask_wait || true
+	if uamask_ok; then
+		rm -f "$UAMASK_FAIL_MARK"
+		log_state_clear uamask "UAmask 重启后正常"
+		return 0
+	fi
+	date +%s > "$UAMASK_FAIL_MARK" 2>/dev/null || true
+	log_state uamask "WARN UAmask 未正常服务（$(uamask_diag)），查 /tmp/UAmask/UAmask.log"
+	warn "    UAmask 仍未正常：$(uamask_diag)"
+	warn "    查看 /tmp/UAmask/UAmask.log；UA 可能没有生效"
+	return 1
+}
+
 disable_ua3f() {	# 旧的 UA3F 会和 UA-Mask 抢 TCP，必须停掉并清表
 	[ -x /etc/init.d/ua3f ] || [ -n "$(uget ua3f.enabled.enabled)" ] || return 0
 	[ "$(uget ua3f.enabled.enabled)" = "0" ] && ! (has nft && nft list table inet UA3F >/dev/null 2>&1) && return 0
@@ -484,7 +631,9 @@ EOF
 
 # TTL：出站伪装人设值 + 入站 TCP/UDP 修复。独立成函数，便于 --ttl 单独跑。
 setup_ttl() {
-	_ttl_want="$(ua_persona_ttl "${UA_STR:-$UAMASK_UA_DEFAULT}")"
+	_ttl_ua="${EFFECTIVE_UA:-${UA_STR:-}}"
+	[ -n "$_ttl_ua" ] || _ttl_ua="$(pick_ua)"
+	_ttl_want="$(ua_persona_ttl "$_ttl_ua")"
 	_lan="$(lan_dev)"
 	_ttl_have=""
 	[ -f "$TTL_FILE" ] && _ttl_have="$(sed -n 's/.*ip ttl set \([0-9]*\).*/\1/p' "$TTL_FILE" 2>/dev/null | head -1)"
@@ -536,11 +685,12 @@ setup_ttl() {
 
 setup_disguise() {
 	info "① 伪装：UA-Mask${TTL_VALUE:+ + TTL=$TTL_VALUE}"
-	if [ -z "$(uget UAmask.enabled.enabled)" ] && [ ! -x /usr/bin/UAmask ]; then
+	if [ -z "$(uget UAmask.enabled.enabled)" ] && ! uamask_bin >/dev/null 2>&1; then
 		warn "    没装 UAmask —— 跳过 UA 改写（本仓库固件内置；老固件可手动装 uamask-*.apk）"
 		warn "    仍然会配置 TTL；要跳过整步：SKIP_DISGUISE=1"
 	else
-		_ua="${UA_STR:-$UAMASK_UA_DEFAULT}"
+		_ua="$(pick_ua)"
+		EFFECTIVE_UA="$_ua"
 		_wl="${UA_WHITELIST:-$UAMASK_WHITELIST_DEFAULT}"
 		case "$UA_MODE" in all|ALL|blacklist) _mode='all' ;; *) _mode='regex' ;; esac
 		disable_ua3f
@@ -576,6 +726,16 @@ setup_disguise() {
 			uci commit UAmask 2>/dev/null || warn "    uci commit UAmask 失败"
 		fi
 		run /etc/init.d/UAmask restart
+		if [ "$DRY_RUN" != 1 ]; then
+			uamask_wait || true
+			if uamask_ok; then
+				say "    UAmask 服务正常（$(uamask_diag)）"
+				uamask_nft_ok || warn "    UAmask 在跑，但 nft 规则没看到：UA 可能没有生效"
+			else
+				warn "    UAmask 未正常服务（$(uamask_diag)）"
+				warn "    查看 /tmp/UAmask/UAmask.log；此时 UA 可能没有生效"
+			fi
+		fi
 		say "    UA-Mask：$_mode 模式，UA=$(printf '%.48s' "$_ua")…"
 		say "    放行名单（不改写 + 命中即卸载出代理）：$_wl"
 	fi
@@ -585,11 +745,11 @@ setup_disguise() {
 }
 
 # ════════════════════════════════════════════════ ② 认证：本校门户三步
-curl_auth() {	# 不走 UA 伪装（路由器自身流量不经 UA-Mask）
+curl_auth() {	# 门户请求也带浏览器 UA（不要用 curl 默认 UA）
 	# http 门户加 -k 无影响；https 门户默认校验证书，自签名证书用 CURL_INSECURE=1
 	case "$PORTAL" in
-		https://*) if [ "$CURL_INSECURE" = 1 ]; then curl -s -m 15 -k "$@"; else curl -s -m 15 "$@"; fi ;;
-		*)         curl -s -m 15 -k "$@" ;;
+		https://*) if [ "$CURL_INSECURE" = 1 ]; then curl -s -m 15 -k -A "$CURL_UA" "$@"; else curl -s -m 15 -A "$CURL_UA" "$@"; fi ;;
+		*)         curl -s -m 15 -k -A "$CURL_UA" "$@" ;;
 	esac
 }
 
@@ -974,7 +1134,7 @@ perm_mac() {
 	esac
 }
 wan_has_ip() { ip -4 -o addr show dev "${1:-$(wan_dev)}" 2>/dev/null | grep -q 'inet '; }
-portal_reach() { curl -s -m 5 -o /dev/null "$PORTAL/" 2>/dev/null; }
+portal_reach() { curl -s -m 5 -A "$CURL_UA" -o /dev/null "$PORTAL/" 2>/dev/null; }
 # 连接表用量：输出 "<count> <max> <pct>"；读不到返回非 0。
 # 为什么盯它：**"新连接失败、已有连接不断"是连接表满了的经典特征**
 # （实测：晚上断、早上好、游戏不断、DNS 还能解析 —— 夜间会话多，过期后自然恢复）。
@@ -1090,7 +1250,7 @@ uninstall_autostart() {
 # 门户是 HTTP、按 IP 访问，walled-garden 里照样打得开 —— 拿它的 Date 头校时最稳，
 # 不依赖任何外网 NTP。
 portal_date() {	# → "Fri, 09 Oct 2026 03:28:34 GMT"
-	curl -sI -m 6 "$PORTAL/" 2>/dev/null | sed -n 's/^[Dd]ate:[[:space:]]*//p' | head -1 | tr -d '\r'
+	curl -sI -m 6 -A "$CURL_UA" "$PORTAL/" 2>/dev/null | sed -n 's/^[Dd]ate:[[:space:]]*//p' | head -1 | tr -d '\r'
 }
 portal_iso() {	# 门户的 GMT 时间 → busybox date 认的 "YYYY-MM-DD hh:mm:ss"
 	local d m
@@ -1223,6 +1383,7 @@ show_status() {
 		[ "$pl" = 1 ] && [ -z "$pa" ] && printf '（acct 空是本门户常态，不代表故障）'
 		printf '\n'
 	fi
+	printf '门户可达 : '; if portal_reach; then echo '是 ✅'; else echo "否 ❌（$PORTAL）"; fi
 	# 连接表：新连接失败但已有连接不断 = 这里满了的经典特征（晚上断、早上好也吻合）
 	_ct="$(ct_stat 2>/dev/null)" || _ct=''
 	if [ -n "$_ct" ]; then
@@ -1271,9 +1432,14 @@ show_status() {
 		printf '           → ⚠️ 启动项不全：路由器重启/掉线后不会自动认证，也不会自动校时\n'
 		printf '             补装：sh %s --install\n' "$SELF_INSTALL"
 	fi
-	if [ -x /usr/bin/UAmask ] || [ -n "$(uget UAmask.enabled.enabled)" ]; then
-		printf 'UA-Mask  : 启用=%s 匹配=%s UA=%s\n' \
-			"$(uget UAmask.enabled.enabled)" "$(uget UAmask.main.match_mode)" "$(printf '%.40s' "$(uget UAmask.main.ua)")"
+	if uamask_bin >/dev/null 2>&1 || [ -n "$(uget UAmask.enabled.enabled)" ]; then
+		printf 'UA-Mask  : 启用=%s 进程=%s 端口=%s nft=%s 匹配=%s UA=%s\n' \
+			"$(uget UAmask.enabled.enabled)" \
+			"$(uamask_pid >/dev/null 2>&1 && echo 在 || echo 不在)" \
+			"$(uamask_listening && echo 在听 || echo 没听)" \
+			"$(uamask_nft_ok && echo 有 || echo 无)" \
+			"$(uget UAmask.main.match_mode)" \
+			"$(printf '%.40s' "$(uget UAmask.main.ua)")"
 	else
 		printf 'UA-Mask  : 没装\n'
 	fi
@@ -1296,6 +1462,7 @@ show_status() {
 MODE="full"
 case "${1:-}" in
 --status)    MODE="status"; shift ;;
+--ua)        MODE="ua"; shift ;;
 --auth)      MODE="auth"; shift ;;
 --auto)      MODE="auto"; QUIET=1; shift ;;
 --ttl)       MODE="ttl"; shift ;;
@@ -1310,7 +1477,7 @@ case "${1:-}" in
 --new-mac)   MODE="newmac"; shift ;;
 --mac-restore) MODE="macrestore"; shift ;;
 --uninstall) MODE="uninstall"; shift ;;
---help|-h)   sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+--help|-h)   sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 --*)          die "未知参数：$1（试试 --help）" ;;
 esac
 # 账号密码的位置随用法而变：`… 账号 密码` 与 `… --auth 账号 密码` 都要能用
@@ -1331,7 +1498,7 @@ case "$MODE" in
 		;;
 esac
 case "$MODE" in
-	full|auth|auto|status|probe|clock|logout|relogin|newmac)
+	full|auth|auto|status|ua|probe|clock|logout|relogin|newmac)
 		has curl || die "找不到 curl —— 先 opkg install curl" ;;
 esac
 case "$PORTAL" in http://*|https://*) ;; *) die "门户地址看着不对：$PORTAL" ;; esac
@@ -1371,6 +1538,15 @@ esac
 
 case "$MODE" in
 status)    show_status; exit 0 ;;
+ua)
+	ensure_uamask; _ua_rc=$?
+	printf 'UA-Mask : 启用=%s 匹配=%s UA=%s %s\n' \
+		"$(uget UAmask.enabled.enabled)" "$(uget UAmask.main.match_mode)" \
+		"$(printf '%.48s' "$(uget UAmask.main.ua)")" "$(uamask_diag)"
+	printf '门户可达 : '
+	if portal_reach; then echo '是 ✅'; else echo "否 ❌（$PORTAL）"; fi
+	exit $_ua_rc
+	;;
 install)   install_autostart; exit 0 ;;
 ttl)       info "只刷新 TTL 规则（不动 UA-Mask / 不认证）"; setup_ttl; exit 0 ;;
 dnsfb)     dns_set fallback; exit 0 ;;
@@ -1404,6 +1580,13 @@ auto)
 		log "检测到启动项缺失，自动补装"
 		# 子 shell 包一层：补装失败（die）不要挡住本次认证
 		( install_autostart ) || log "启动项补装失败（继续认证）"
+	fi
+	# 每次启动先检查：UA-Mask 的 UA/配置/服务是否正常 + 校园门户是否可达
+	if [ "${UA_AUTO:-1}" = 1 ]; then ensure_uamask || true; fi
+	if portal_reach; then
+		log_state_clear portal "校园门户可达（$PORTAL）"
+	else
+		log_state portal "WARN 校园门户不可达（$PORTAL）"
 	fi
 	if online; then
 		rm -f "$AUTH_FAIL_MARK"
@@ -1475,6 +1658,7 @@ auth)
 full)
 	read_conf
 	info "本校校园网一键：伪装 → 认证 → 启动项（账号 ${CAMPUS_USER:-（配置里/稍后问）}）"
+	if portal_reach; then say "门户可达：$PORTAL"; else warn "门户不可达：$PORTAL（先查 WAN/线路）"; fi
 	[ "$SKIP_DISGUISE" = 1 ] && say "（SKIP_DISGUISE=1：跳过伪装）" || setup_disguise
 	if online; then
 		say "外网已通，跳过认证"
